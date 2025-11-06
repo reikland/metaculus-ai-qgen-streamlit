@@ -3,17 +3,6 @@ from typing import Dict, Any, List, Optional, Tuple
 import pandas as pd
 import streamlit as st
 
-def get_openrouter_key():
-    v = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if not v:
-        try:
-            if "OPENROUTER_API_KEY" in st.secrets:
-                v = str(st.secrets["OPENROUTER_API_KEY"]).strip()
-        except Exception:
-            v = ""
-    return v
-
-OPENROUTER_API_KEY = get_openrouter_key()
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS = "https://openrouter.ai/api/v1/models"
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "").strip()
@@ -31,6 +20,21 @@ PREFERRED_MODELS = [
     "google/gemma-2-9b-it:free",
 ]
 
+def get_openrouter_key() -> str:
+    try:
+        v = st.session_state.get("OPENROUTER_API_KEY_OVERRIDE", "").strip()
+    except Exception:
+        v = ""
+    if not v:
+        v = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not v:
+        try:
+            if "OPENROUTER_API_KEY" in st.secrets:
+                v = str(st.secrets["OPENROUTER_API_KEY"]).strip()
+        except Exception:
+            pass
+    return v
+
 def ascii_safe(s: str) -> str:
     try:
         return s.encode("latin-1", "ignore").decode("latin-1")
@@ -38,10 +42,11 @@ def ascii_safe(s: str) -> str:
         return "".join(ch for ch in s if ord(ch) < 256)
 
 def or_headers() -> Dict[str, str]:
-    if not OPENROUTER_API_KEY:
+    key = get_openrouter_key()
+    if not key:
         raise RuntimeError("Missing OPENROUTER_API_KEY")
     return {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Referer": ascii_safe(REFERER),
@@ -428,11 +433,11 @@ around the OpenRouter API, with critique, judging and pairwise ranking.
 """
 )
 
-if not OPENROUTER_API_KEY:
-    st.warning("No OPENROUTER_API_KEY detected. Set it as an environment variable or in Streamlit secrets.")
-
 with st.sidebar:
     st.header("Settings")
+    api_key_input = st.text_input("OpenRouter API key", type="password", help="Key will be kept only in this session.")
+    if api_key_input:
+        st.session_state["OPENROUTER_API_KEY_OVERRIDE"] = api_key_input.strip()
     n = st.slider("Number of candidates to generate", min_value=3, max_value=30, value=10, step=1)
     top_k = st.slider("Top K after ranking", min_value=2, max_value=10, value=5, step=1)
     dry_run = st.checkbox("Dry run (no API calls, mock output)", value=False)
@@ -440,6 +445,10 @@ with st.sidebar:
         "Optional: Metaculus example questions CSV",
         type=["csv"],
     )
+
+current_key = get_openrouter_key()
+if not current_key and not dry_run:
+    st.warning("No OPENROUTER_API_KEY detected. Enter it in the sidebar, or set it as an environment variable / Streamlit secret.")
 
 st.subheader("Problem setup")
 
@@ -462,9 +471,10 @@ horizon = st.text_input(
 run_button = st.button("Generate and rank questions")
 
 if run_button:
+    current_key = get_openrouter_key()
     if not brief.strip():
         st.warning("Please provide at least a short topic brief.")
-    elif not OPENROUTER_API_KEY and not dry_run:
+    elif not current_key and not dry_run:
         st.error("No OPENROUTER_API_KEY set and dry_run is disabled.")
     else:
         tags = [t.strip() for t in tags_str.split(",") if t.strip()]
@@ -568,3 +578,4 @@ if run_button:
             )
         else:
             st.info("No candidates generated.")
+
