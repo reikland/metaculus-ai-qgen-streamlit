@@ -2,9 +2,8 @@
 # -*- coding: utf-8 -*-
 
 import os
-import json
-import re
 import io
+import re
 import time
 import textwrap
 from typing import Dict, Any, List, Optional
@@ -21,7 +20,7 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL_ENV = os.environ.get("OPENROUTER_MODEL", "").strip()
 
 REFERER = "https://localhost"
-TITLE = "Metaculus – Question Generator + Judge"
+TITLE = "Metaculus – Question Generator + Judge (Text Template)"
 
 DEFAULT_MODEL = "openai/gpt-4o-mini"
 
@@ -73,7 +72,7 @@ def or_headers() -> Dict[str, str]:
         "Accept": "application/json",
         "Referer": ascii_safe(REFERER),
         "X-Title": ascii_safe(TITLE),
-        "User-Agent": ascii_safe("metaculus-qgen-judge/0.1"),
+        "User-Agent": ascii_safe("metaculus-qgen-judge-text/0.1"),
     }
 
 
@@ -85,6 +84,8 @@ def call_openrouter_raw(
     retries: int = 3,
 ) -> str:
     """Appel brut à OpenRouter, retourne simplement le texte de réponse."""
+    import json as _json
+
     payload = {
         "model": model,
         "messages": messages,
@@ -127,112 +128,22 @@ def call_openrouter_raw(
 
 
 # ============================================================
-# 3. JSON PARSING – SIMPLE & ROBUST
-# ============================================================
-
-def extract_code_fence(s: str) -> Optional[str]:
-    m = re.search(r"```(?:json)?\s*(.*?)\s*```", s, flags=re.DOTALL | re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    return None
-
-
-def balanced_slice(s: str, open_char: str, close_char: str) -> Optional[str]:
-    start = s.find(open_char)
-    if start == -1:
-        return None
-    depth = 0
-    for i in range(start, len(s)):
-        c = s[i]
-        if c == open_char:
-            depth += 1
-        elif c == close_char:
-            depth -= 1
-            if depth == 0:
-                return s[start:i+1]
-    return None
-
-
-def parse_json_relaxed(s: str) -> Any:
-    """
-    Essaie fort de récupérer un JSON valide depuis la sortie du modèle.
-
-    On :
-    - enlève les ``` et "json",
-    - supprime les virgules finales avant } ou ],
-    - tente de parser la chaîne entière,
-    - sinon, on essaie de trouver un bloc [ ... ] ou { ... } équilibré.
-    """
-    s = s.strip()
-
-    # Enlève les fences éventuelles
-    s = re.sub(r"```(?:json)?", "", s, flags=re.IGNORECASE)
-    s = s.replace("```", "")
-
-    # Supprime les virgules finales avant } ou ]
-    s = re.sub(r",(\s*[}\]])", r"\1", s)
-
-    # 1) tentative directe
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
-
-    # 2) bloc array
-    blk = balanced_slice(s, "[", "]")
-    if blk:
-        try:
-            return json.loads(blk)
-        except Exception:
-            pass
-
-    # 3) bloc objet
-    blk = balanced_slice(s, "{", "}")
-    if blk:
-        try:
-            return json.loads(blk)
-        except Exception:
-            pass
-
-    # 4) chaque { ... } individuellement
-    objs = []
-    for m in re.finditer(r"\{.*?\}", s, flags=re.DOTALL):
-        try:
-            objs.append(json.loads(m.group(0)))
-        except Exception:
-            continue
-    if objs:
-        return objs if len(objs) > 1 else objs[0]
-
-    raise ValueError("Could not parse JSON from model output")
-
-
-# ============================================================
-# 4. PROMPTS – GÉNÉRATION + JUGE (PLAUDIBILITÉ)
+# 3. PROMPTS – GÉNÉRATION + JUGE (TEMPLATE TEXTE)
 # ============================================================
 
 GEN_SYS = """
-You are a JSON API, not a chat assistant.
+You generate forecasting questions in a STRICT, line-based text template.
 
-Your ONLY task is to output machine-readable JSON that can be parsed by json.loads in Python
-and JSON.parse in JavaScript without any preprocessing.
-
-Hard constraints:
-- Output EXACTLY ONE JSON value, which MUST be a JSON array of objects.
-- NO text before or after the array.
-- NO markdown, NO code fences, NO comments, NO explanations.
-- Use only double quotes for strings. Never use single quotes.
-- Never include trailing commas.
-- Allowed literals: null, true, false, numbers, strings, arrays, objects.
-- Never output NaN, Infinity, or -Infinity.
-
-If you violate these constraints, the calling application will fail.
-Return STRICT JSON only.
+Rules (CRITICAL):
+- Do NOT use markdown, bullets, JSON, or code fences.
+- Do NOT add any commentary before the first question or after the last one.
+- All fields must be on ONE line (no internal line breaks).
+- You MUST respect the template exactly, with the same field labels and order.
 """.strip()
 
 GEN_USER_TMPL = textwrap.dedent(
     """
-    Task: Generate {n} Metaculus-style forecasting questions.
+    Task: Generate {n} Metaculus-style forecasting questions (true questions i.e with a "?" at the end of the sentence).
 
     Topic brief (3–6 lines):
     {brief}
@@ -240,16 +151,20 @@ GEN_USER_TMPL = textwrap.dedent(
     Domain tags: {tags}
     Target horizon (if relevant): {horizon}
 
-    For EACH question, output an object with EXACTLY these keys:
-      - "title": short, <= 100 characters
-      - "body": 2–5 sentences describing context
-      - "resolution_criteria": exact steps to decide YES/NO or measure the outcome
-      - "timeframe": an object with "start", "end", "timezone" (ISO-like strings, timezone = "UTC")
-      - "answer_type": one of "binary", "numeric", "date", "multiple"
+    For EACH question i = 1..{n}, you MUST output a block with EXACTLY this template:
 
-    Substantive constraints:
+    QUESTION i
+    Title: <short title, <= 100 characters>
+    Body: <2–5 sentences, BUT all on a single line (no line breaks)>
+    Resolution: <exact steps to resolve (who/what/when/where), single line>
+    Timeframe-start: <YYYY-MM-DD HH:MM:SS UTC or empty if unknown>
+    Timeframe-end: <YYYY-MM-DD HH:MM:SS UTC (target resolution time), or empty>
+    Timezone: UTC
+    Answer-type: <one of: binary, numeric, date, multiple>
+
+    Constraints on content:
     - Outcomes must be resolvable from public sources (official statistics, reputable newswires, etc.).
-    - Include explicit end dates (UTC) and clear thresholds.
+    - Include explicit end dates (UTC) when possible and clear thresholds.
     - Questions should be PLAUSIBLE: numeric thresholds, dates and quantities must be in realistic
       ranges consistent with current public information and known orders of magnitude.
       Avoid arbitrary or random-looking numbers (e.g. "17,345,678,901") when you have no basis.
@@ -258,86 +173,63 @@ GEN_USER_TMPL = textwrap.dedent(
         - relative comparisons ("higher than in 2024"),
         - or coarse thresholds (e.g. "above 3× the 2024 value"),
       instead of a very specific figure that is likely to be wrong.
-    - If you have internet/tools, you MAY look up up-to-date facts, but still output only JSON.
     - Avoid questions already resolved at time of writing; there must be genuine uncertainty.
 
     OUTPUT FORMAT (CRITICAL):
-    - Return a SINGLE JSON ARRAY of EXACTLY {n} objects.
-    - Do NOT wrap it in markdown.
-    - Do NOT add any explanation or commentary.
-    - Do NOT include trailing commas.
-
-    Example of the STRUCTURE only (values are placeholders, but this is valid JSON):
-    [
-      {{
-        "title": "Example question title",
-        "body": "Example body text.",
-        "resolution_criteria": "How the question will be resolved.",
-        "timeframe": {{
-          "start": "2025-01-01 00:00:00",
-          "end": "2030-12-31 23:59:59",
-          "timezone": "UTC"
-        }},
-        "answer_type": "binary"
-      }}
-    ]
+    - You MUST output EXACTLY {n} question blocks, numbered QUESTION 1, QUESTION 2, ..., QUESTION {n}.
+    - Each block MUST follow the template above, in the same order and with the same labels.
+    - Separate blocks with a single blank line.
+    - Do NOT add any other lines, explanations, headings or comments.
     """
 )
 
 JUDGE_SYS = """
-You are a JSON API, not a chat assistant.
+You rate forecasting questions in a single semicolon-separated line.
 
-You score candidate forecasting questions.
-
-Your ONLY task is to output machine-readable JSON that can be parsed by json.loads in Python
-and JSON.parse in JavaScript without any preprocessing.
-
-Constraints:
-- Output EXACTLY ONE JSON object.
-- NO markdown, NO code fences, NO comments, NO explanations.
-- Use only double quotes for strings. Never use single quotes.
-- Never include trailing commas, NaN, Infinity, or -Infinity.
-
-Return STRICT JSON only.
+Rules (CRITICAL):
+- Output exactly ONE line of text.
+- Format must be:
+  clarity=X; operationalization=Y; plausibility=Z; usefulness=U; safety=S; overall=O; notes=TEXT
+- X,Y,Z,U,S are integers 1–5.
+- O is a float 1–5 (mean of the five scores, rounded to 2 decimals).
+- Do NOT use semicolons in notes; use commas instead.
+- No markdown, no extra lines, no JSON.
 """.strip()
 
 JUDGE_USER_TMPL = textwrap.dedent(
     """
-    Evaluate the following forecasting question for Metaculus-style use.
+    Rate the following forecasting question for Metaculus-style use on 5 dimensions:
+    - clarity (1–5),
+    - operationalization (1–5) – how well it can be mechanically resolved,
+    - plausibility (1–5) – are numbers/dates/scenarios realistic vs known orders of magnitude,
+    - usefulness (1–5) – decision/forecast value,
+    - safety (1–5) – policy/abuse issues.
 
-    You MUST return a SINGLE JSON object with EXACTLY these keys:
-      - "clarity": integer from 1 to 5
-      - "operationalization": integer from 1 to 5 (how well it can be mechanically resolved)
-      - "plausibility": integer from 1 to 5 (are the numbers, dates, and scenarios realistic and
-        consistent with known orders of magnitude, not obviously pulled from thin air?)
-      - "usefulness": integer from 1 to 5 (decision/forecasting value)
-      - "safety": integer from 1 to 5 (no obvious policy/abuse/harassment issues)
-      - "overall": float from 1 to 5 (mean of the 5 scores, rounded to 2 decimals)
-      - "notes": a short justification string (<= 300 characters)
+    Then compute overall as the mean of the 5 scores, rounded to 2 decimals.
 
-    Example of valid JSON output (values are illustrative only):
-    {{
-      "clarity": 5,
-      "operationalization": 4,
-      "plausibility": 4,
-      "usefulness": 5,
-      "safety": 5,
-      "overall": 4.60,
-      "notes": "Clear question; uses realistic ranges and resolvable statistics."
-    }}
+    You MUST respond with EXACTLY ONE line:
+    clarity=X; operationalization=Y; plausibility=Z; usefulness=U; safety=S; overall=O; notes=TEXT
 
-    Remember:
-    - Do NOT output markdown or code fences.
-    - Do NOT include comments or trailing commas.
+    Where:
+    - X,Y,Z,U,S are integers 1–5,
+    - O is a float 1–5,
+    - TEXT is a short justification (<= 300 characters),
+    - Do NOT use semicolons in TEXT.
 
-    Candidate question (JSON):
-    {candidate_json}
+    Question:
+    Title: {title}
+    Body: {body}
+    Resolution: {resolution}
+    Timeframe-start: {tstart}
+    Timeframe-end: {tend}
+    Timezone: {tz}
+    Answer-type: {atype}
     """
 )
 
 
 # ============================================================
-# 5. CORE GENERATION LOGIC
+# 4. PARSING – QUESTIONS & SCORES
 # ============================================================
 
 def mock_questions(brief: str, n: int) -> List[Dict[str, Any]]:
@@ -349,20 +241,176 @@ def mock_questions(brief: str, n: int) -> List[Dict[str, Any]]:
             {
                 "title": f"[MOCK] {prefix} – Q{i+1}",
                 "body": "This is a mock question body for testing the UI.",
-                "resolution_criteria": (
+                "resolution": (
                     "On 2030-12-31 23:59:59 UTC, check source X; "
                     "resolve YES if condition Y holds, otherwise NO."
                 ),
-                "timeframe": {
-                    "start": "2025-01-01 00:00:00",
-                    "end": "2030-12-31 23:59:59",
-                    "timezone": "UTC",
-                },
+                "timeframe_start": "2025-01-01 00:00:00",
+                "timeframe_end": "2030-12-31 23:59:59",
+                "timezone": "UTC",
                 "answer_type": "binary",
             }
         )
     return out
 
+
+def parse_questions_from_text(text: str) -> List[Dict[str, Any]]:
+    """
+    Parse la sortie du générateur au format :
+
+    QUESTION i
+    Title: ...
+    Body: ...
+    Resolution: ...
+    Timeframe-start: ...
+    Timeframe-end: ...
+    Timezone: ...
+    Answer-type: ...
+    """
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    questions: List[Dict[str, Any]] = []
+
+    current: Optional[Dict[str, Any]] = None
+
+    def push_current():
+        nonlocal current
+        if current and (current.get("title") or current.get("body")):
+            questions.append(current)
+        current = None
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+
+        m_q = re.match(r"^QUESTION\s+(\d+)", line, flags=re.IGNORECASE)
+        if m_q:
+            # Nouvelle question
+            push_current()
+            current = {
+                "title": "",
+                "body": "",
+                "resolution": "",
+                "timeframe_start": "",
+                "timeframe_end": "",
+                "timezone": "",
+                "answer_type": "",
+            }
+            continue
+
+        if current is None:
+            # Ignore tout texte avant la première "QUESTION"
+            continue
+
+        # Parsing champ: "Key: value"
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        key = key.strip().lower()
+        val = val.strip()
+
+        if key == "title":
+            current["title"] = val
+        elif key == "body":
+            current["body"] = val
+        elif key == "resolution":
+            current["resolution"] = val
+        elif key == "timeframe-start":
+            current["timeframe_start"] = val
+        elif key == "timeframe-end":
+            current["timeframe_end"] = val
+        elif key == "timezone":
+            current["timezone"] = val
+        elif key == "answer-type":
+            current["answer_type"] = val
+
+    # Dernière question
+    push_current()
+    return questions
+
+
+def parse_judge_line(line: str) -> Dict[str, Any]:
+    """
+    Parse une ligne du type :
+    clarity=X; operationalization=Y; plausibility=Z; usefulness=U; safety=S; overall=O; notes=TEXT
+    """
+    line = line.strip()
+    # On sépare sur ';' mais en gardant tout ce qui dépasse pour notes
+    parts = [p.strip() for p in line.split(";")]
+    # On veut au moins 6 segments pour les scores, le reste = notes
+    if len(parts) < 6:
+        raise ValueError(f"Judge line too short: {line!r}")
+
+    mapping: Dict[str, Any] = {}
+    def parse_val(segment: str) -> (str, str):
+        if "=" not in segment:
+            return segment.strip().lower(), ""
+        k, v = segment.split("=", 1)
+        return k.strip().lower(), v.strip()
+
+    # clarity, operationalization, plausibility, usefulness, safety, overall
+    keys_expected = ["clarity", "operationalization", "plausibility",
+                     "usefulness", "safety", "overall"]
+
+    for i, key_name in enumerate(keys_expected):
+        if i >= len(parts):
+            break
+        k, v = parse_val(parts[i])
+        if k != key_name:
+            # clé inattendue, on essaie quand même d'interpréter
+            k = key_name
+        mapping[k] = v
+
+    # notes = le reste
+    if len(parts) > len(keys_expected):
+        notes_raw = ";".join(parts[len(keys_expected):]).strip()
+        # enlever éventuel "notes=" au début
+        if notes_raw.lower().startswith("notes="):
+            notes_raw = notes_raw[6:].strip()
+        mapping["notes"] = notes_raw
+    else:
+        mapping["notes"] = ""
+
+    # Convertir les scores
+    def to_int(name: str, default: int = 3) -> int:
+        try:
+            return int(round(float(mapping.get(name, default))))
+        except Exception:
+            return default
+
+    def to_float(name: str, default: float = 0.0) -> float:
+        try:
+            return float(mapping.get(name, default))
+        except Exception:
+            return default
+
+    clarity = to_int("clarity")
+    operationalization = to_int("operationalization")
+    plausibility = to_int("plausibility")
+    usefulness = to_int("usefulness")
+    safety = to_int("safety", default=5)
+    overall = to_float("overall", default=0.0)
+
+    if overall <= 0:
+        overall = round(
+            (clarity + operationalization + plausibility + usefulness + safety) / 5.0,
+            2,
+        )
+
+    return {
+        "clarity": clarity,
+        "operationalization": operationalization,
+        "plausibility": plausibility,
+        "usefulness": usefulness,
+        "safety": safety,
+        "overall": round(overall, 2),
+        "notes": mapping.get("notes", ""),
+    }
+
+
+# ============================================================
+# 5. PIPELINE – GÉNÉRATION & JUGE
+# ============================================================
 
 def generate_questions(
     brief: str,
@@ -373,11 +421,7 @@ def generate_questions(
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """
-    Génère des questions, sans étape intermédiaire.
-    Retourne un dict avec :
-      - "model"
-      - "questions" (liste d'objets normalisés)
-      - "raw_output" (texte brut du modèle, pour debug)
+    Génère des questions au format texte structuré, puis parse en liste de dicts.
     """
     if dry_run:
         qs = mock_questions(brief, n)
@@ -400,76 +444,15 @@ def generate_questions(
         temperature=0.5,
     )
 
-    try:
-        data = parse_json_relaxed(raw)
-    except Exception as e:
-        snippet = raw[:600].replace("\n", "\\n")
+    questions = parse_questions_from_text(raw)
+    if not questions:
         raise RuntimeError(
-            f"Model output was not valid JSON: {e}. "
-            f"First 600 chars: {snippet!r}"
-        ) from e
-
-    # ======================================================
-    # Normalisation de la forme du JSON -> liste de questions
-    # ======================================================
-    questions: List[Dict[str, Any]] = []
-
-    if isinstance(data, list):
-        # Cas idéal : le modèle renvoie déjà un tableau
-        questions = data
-
-    elif isinstance(data, dict):
-        # 1) Clé "questions"
-        if isinstance(data.get("questions"), list):
-            questions = data["questions"]
-        else:
-            # 2) Chercher une valeur qui soit une liste de dicts
-            for v in data.values():
-                if isinstance(v, list) and v and isinstance(v[0], dict):
-                    questions = v
-                    break
-
-            # 3) Sinon, interpréter le dict lui-même comme UNE question
-            if not questions:
-                questions = [data]
-    else:
-        raise RuntimeError(
-            f"Parsed JSON is neither an array nor an object; got type {type(data).__name__}."
+            "Could not parse any questions from model output. "
+            "Check format and model obedience."
         )
 
-    # ==========================================
-    # Normalisation champ par champ des questions
-    # ==========================================
-    norm_questions: List[Dict[str, Any]] = []
-    for q in questions:
-        if not isinstance(q, dict):
-            continue
-        tf = q.get("timeframe") or {}
-        if not isinstance(tf, dict):
-            tf = {}
-        norm_questions.append(
-            {
-                "title": q.get("title", ""),
-                "body": q.get("body", ""),
-                "resolution_criteria": q.get("resolution_criteria", ""),
-                "timeframe": {
-                    "start": tf.get("start", ""),
-                    "end": tf.get("end", ""),
-                    "timezone": tf.get("timezone", ""),
-                },
-                "answer_type": q.get("answer_type", ""),
-            }
-        )
+    return {"model": model, "questions": questions, "raw_output": raw}
 
-    if not norm_questions:
-        raise RuntimeError("No valid question objects found in JSON.")
-
-    return {"model": model, "questions": norm_questions, "raw_output": raw}
-
-
-# ============================================================
-# 6. JUDGE LOGIC (SCORE + TOP K)
-# ============================================================
 
 def judge_question(
     question: Dict[str, Any],
@@ -484,26 +467,30 @@ def judge_question(
     if dry_run:
         import random
         clarity = random.randint(3, 5)
-        operationalization = random.randint(3, 5)
-        plausibility = random.randint(3, 5)
-        usefulness = random.randint(3, 5)
+        oper = random.randint(3, 5)
+        plaus = random.randint(3, 5)
+        use = random.randint(3, 5)
         safety = 5
-        overall = round(
-            (clarity + operationalization + plausibility + usefulness + safety) / 5.0,
-            2,
-        )
+        overall = round((clarity + oper + plaus + use + safety) / 5.0, 2)
         return {
             "clarity": clarity,
-            "operationalization": operationalization,
-            "plausibility": plausibility,
-            "usefulness": usefulness,
+            "operationalization": oper,
+            "plausibility": plaus,
+            "usefulness": use,
             "safety": safety,
             "overall": overall,
             "notes": "Mock scores for dry-run mode.",
         }
 
-    candidate_json = json.dumps(question, ensure_ascii=False)
-    user = JUDGE_USER_TMPL.format(candidate_json=candidate_json)
+    user = JUDGE_USER_TMPL.format(
+        title=question.get("title", ""),
+        body=question.get("body", ""),
+        resolution=question.get("resolution", ""),
+        tstart=question.get("timeframe_start", ""),
+        tend=question.get("timeframe_end", ""),
+        tz=question.get("timezone", ""),
+        atype=question.get("answer_type", ""),
+    )
 
     raw = call_openrouter_raw(
         messages=[
@@ -511,56 +498,14 @@ def judge_question(
             {"role": "user", "content": user},
         ],
         model=model,
-        max_tokens=800,
+        max_tokens=400,
         temperature=0.0,
     )
 
     try:
-        data = parse_json_relaxed(raw)
+        return parse_judge_line(raw)
     except Exception as e:
-        snippet = raw[:400].replace("\n", "\\n")
-        raise RuntimeError(
-            f"Judge output was not valid JSON: {e}. "
-            f"First 400 chars: {snippet!r}"
-        ) from e
-
-    if not isinstance(data, dict):
-        raise RuntimeError("Judge JSON is not an object.")
-
-    def as_int(name: str, default: int = 3) -> int:
-        v = data.get(name, default)
-        try:
-            return int(round(float(v)))
-        except Exception:
-            return default
-
-    clarity = as_int("clarity")
-    operationalization = as_int("operationalization")
-    plausibility = as_int("plausibility")
-    usefulness = as_int("usefulness")
-    safety = as_int("safety", default=5)
-
-    try:
-        overall = float(data.get("overall", 0.0))
-        if overall <= 0:
-            raise ValueError()
-    except Exception:
-        overall = round(
-            (clarity + operationalization + plausibility + usefulness + safety) / 5.0,
-            2,
-        )
-
-    notes = str(data.get("notes", "") or "")
-
-    return {
-        "clarity": clarity,
-        "operationalization": operationalization,
-        "plausibility": plausibility,
-        "usefulness": usefulness,
-        "safety": safety,
-        "overall": round(overall, 2),
-        "notes": notes,
-    }
+        raise RuntimeError(f"Failed to parse judge output: {e}. Raw: {raw!r}") from e
 
 
 def judge_all_questions(
@@ -576,7 +521,7 @@ def judge_all_questions(
 
 
 # ============================================================
-# 7. STREAMLIT UI
+# 6. STREAMLIT UI
 # ============================================================
 
 st.set_page_config(
@@ -585,12 +530,12 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("Metaculus – Question Generator + Judge")
+st.title("Metaculus – Question Generator + Judge (Text Template)")
 
 st.markdown(
     """
-Simple pipeline:
-1. Generate N Metaculus-style questions (JSON only).
+Pipeline:
+1. Generate N Metaculus-style questions with a strict line-based template (no JSON).
 2. Score each question on clarity, operationalization, PLAUSIBILITY, usefulness, safety.
 3. Keep the top K questions by overall score.
 """
@@ -665,7 +610,7 @@ horizon = st.text_input(
 run_button = st.button("Generate + Judge questions")
 
 # ------------------------------------------------------------
-# 8. RUN PIPELINE ON BUTTON CLICK
+# 7. RUN PIPELINE ON BUTTON CLICK
 # ------------------------------------------------------------
 
 if run_button:
@@ -676,6 +621,8 @@ if run_button:
     else:
         tags = [t.strip() for t in tags_str.split(",") if t.strip()]
         model = (model_override or "").strip() or DEFAULT_MODEL
+
+        st.info(f"Using model: `{model}`")
 
         with st.spinner("Generating questions..."):
             try:
@@ -732,7 +679,7 @@ if run_button:
         st.session_state["qgen_result"] = res
 
 # ------------------------------------------------------------
-# 9. DISPLAY LAST RESULT (PERSISTENT)
+# 8. DISPLAY LAST RESULT (PERSISTENT)
 # ------------------------------------------------------------
 
 res = st.session_state.get("qgen_result")
@@ -750,7 +697,6 @@ if res is not None:
     for e in entries:
         q = e["question"]
         s = e["scores"]
-        tf = q.get("timeframe") or {}
         rows.append(
             {
                 "overall": s.get("overall", 0.0),
@@ -761,10 +707,10 @@ if res is not None:
                 "safety": s.get("safety"),
                 "title": q.get("title", ""),
                 "body": q.get("body", ""),
-                "resolution_criteria": q.get("resolution_criteria", ""),
-                "timeframe_start": tf.get("start", ""),
-                "timeframe_end": tf.get("end", ""),
-                "timezone": tf.get("timezone", ""),
+                "resolution": q.get("resolution", ""),
+                "timeframe_start": q.get("timeframe_start", ""),
+                "timeframe_end": q.get("timeframe_end", ""),
+                "timezone": q.get("timezone", ""),
                 "answer_type": q.get("answer_type", ""),
                 "judge_notes": s.get("notes", ""),
             }
@@ -780,7 +726,7 @@ if res is not None:
     st.markdown("### Best question (rank #1)")
     st.markdown(f"**Title:** {top['title']}")
     st.markdown(f"**Body:** {top['body']}")
-    st.markdown(f"**Resolution criteria:** {top['resolution_criteria']}")
+    st.markdown(f"**Resolution:** {top['resolution']}")
     st.markdown(
         f"**Timeframe:** {top['timeframe_start']} → "
         f"{top['timeframe_end']} ({top['timezone'] or 'UTC'})"
@@ -810,7 +756,8 @@ if res is not None:
                 "scores": e["scores"],
             }
         )
-    json_bytes = json.dumps(
+    import json as _json
+    json_bytes = _json.dumps(
         {"model": model, "entries": export_list},
         ensure_ascii=False,
         indent=2,
@@ -832,7 +779,6 @@ if res is not None:
 
     # Zone optionnelle pour inspecter la sortie brute du générateur
     with st.expander("Raw generation output (debug)"):
-        st.code(raw_output, language="json")
+        st.code(raw_output, language="text")
 else:
     st.info("Configure your topic and click 'Generate + Judge questions' to start.")
-
