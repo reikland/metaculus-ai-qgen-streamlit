@@ -1,4 +1,4 @@
-import os, time, csv, json, requests, itertools, random, re, io, tempfile
+import os, time, csv, json, requests, itertools, random, re, io, tempfile, textwrap
 from typing import Dict, Any, List, Optional, Tuple
 import pandas as pd
 import streamlit as st
@@ -352,30 +352,35 @@ def load_examples_csv(path: str, k_good: int = 3, k_bad: int = 2) -> Tuple[List[
 
 
 GEN_SYS = "You are a senior Metaculus question writer. Return STRICT JSON only."
-GEN_USER_TMPL = """Task: Generate {n} candidate forecasting questions matching Metaculus style.
+GEN_USER_TMPL = textwrap.dedent(
+    """
+    Task: Generate {n} candidate forecasting questions matching Metaculus style.
 
-Topic brief (3–6 lines):
-{brief}
+    Topic brief (3–6 lines):
+    {brief}
 
-Domain tags: {tags} | Target horizon (if relevant): {horizon}
+    Domain tags: {tags} | Target horizon (if relevant): {horizon}
 
-For EACH candidate, output an object with:
-"title", "body", "resolution_criteria", "timeframe":{{"start":"...","end":"...","timezone":"UTC"}},
-"canonical_source": ["Publisher names or URLs allowed"], "answer_type": "binary|numeric|date|multiple",
-"proposed_bins_or_ranges": "...(if numeric)", "difficulty": "low|med|high",
-"rationale": "why decision-relevant and non-trivial", "policy_notes": "safety/legal notes".
+    For EACH candidate, output an object with:
+    "title", "body", "resolution_criteria", "timeframe":{{"start":"...","end":"...","timezone":"UTC"}},
+    "canonical_source": ["Publisher names or URLs allowed"], "answer_type": "binary|numeric|date|multiple",
+    "proposed_bins_or_ranges": "...(if numeric)", "difficulty": "low|med|high",
+    "rationale": "why decision-relevant and non-trivial", "policy_notes": "safety/legal notes".
 
-Constraints:
-- Outcomes must be independently verifiable from public sources; cite canonical_source (publishers allowed; URLs optional).
-- Include explicit end dates (UTC) and exact resolution checks; avoid vague terms unless thresholded.
-- Title ≤ 100 chars; body 2–5 concise sentences.
-- Return a STRICT JSON array of {n} objects; no commentary, no markdown fences. If you add prose/fences, output will be discarded.
-Few-shot good examples:
-{good_examples}
+    Constraints:
+    - Outcomes must be independently verifiable from public sources; cite canonical_source (publishers allowed; URLs optional).
+    - Include explicit end dates (UTC) and exact resolution checks; avoid vague terms unless thresholded.
+    - If you have tools or internet access, research current figures/dates and cite the sources you rely on.
+    - Title ≤ 100 chars; body 2–5 concise sentences.
+    - Return a STRICT JSON array of {n} objects; no commentary, no markdown fences. If you add prose/fences, output will be discarded.
 
-Few-shot bad/avoid examples (with reasons to avoid):
-{bad_examples}
-"""
+    Few-shot good examples:
+    {good_examples}
+
+    Few-shot bad/avoid examples (with reasons to avoid):
+    {bad_examples}
+    """
+)
 
 CRIT_SYS = "You are a meticulous Metaculus question editor. Return STRICT JSON."
 CRIT_USER_TMPL = """Given this candidate JSON, rate 1–5 on each dimension:
@@ -414,32 +419,10 @@ B:
 """
 
 
-def generate_candidates(brief: str, tags: List[str], horizon: str, n: int, good: List[Dict[str, Any]], bad: List[Dict[str, Any]], model: str, dry_run: bool = False) -> List[Dict[str, Any]]:
-    if dry_run:
-        out = []
-        for i in range(n):
-            out.append(
-                {
-                    "title": f"[MOCK] {brief[:40]} — Q{i+1}",
-                    "body": "Context lines. Why it matters. Actors involved.",
-                    "resolution_criteria": "On 2030-12-31 23:59:59 UTC, check source X for Y; YES if Z; otherwise NO.",
-                    "timeframe": {
-                        "start": "2026-01-01 00:00:00",
-                        "end": "2030-12-31 23:59:59",
-                        "timezone": "UTC",
-                    },
-                    "canonical_source": ["Reuters", "official press release"],
-                    "answer_type": "binary",
-                    "proposed_bins_or_ranges": "",
-                    "difficulty": "med",
-                    "rationale": "Decision-relevant; not trivially predictable.",
-                    "policy_notes": "",
-                }
-            )
-        return out
+def _build_generation_prompt(brief: str, tags: List[str], horizon: str, n: int, good: List[Dict[str, Any]], bad: List[Dict[str, Any]]) -> str:
     good_str = json.dumps(good, ensure_ascii=False) if good else "[]"
     bad_str = json.dumps(bad, ensure_ascii=False) if bad else "[]"
-    user = GEN_USER_TMPL.format(
+    return GEN_USER_TMPL.format(
         n=n,
         brief=brief,
         tags=",".join(tags),
@@ -447,6 +430,37 @@ def generate_candidates(brief: str, tags: List[str], horizon: str, n: int, good:
         good_examples=good_str,
         bad_examples=bad_str,
     )
+
+
+def _mock_candidates(brief: str, n: int) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for i in range(n):
+        out.append(
+            {
+                "title": f"[MOCK] {brief[:40]} — Q{i+1}",
+                "body": "Context lines. Why it matters. Actors involved.",
+                "resolution_criteria": "On 2030-12-31 23:59:59 UTC, check source X for Y; YES if Z; otherwise NO.",
+                "timeframe": {
+                    "start": "2026-01-01 00:00:00",
+                    "end": "2030-12-31 23:59:59",
+                    "timezone": "UTC",
+                },
+                "canonical_source": ["Reuters", "official press release"],
+                "answer_type": "binary",
+                "proposed_bins_or_ranges": "",
+                "difficulty": "med",
+                "rationale": "Decision-relevant; not trivially predictable.",
+                "policy_notes": "",
+            }
+        )
+    return out
+
+
+def generate_candidates(brief: str, tags: List[str], horizon: str, n: int, good: List[Dict[str, Any]], bad: List[Dict[str, Any]], model: str, dry_run: bool = False) -> List[Dict[str, Any]]:
+    if dry_run:
+        return _mock_candidates(brief, n)
+
+    user = _build_generation_prompt(brief=brief, tags=tags, horizon=horizon, n=n, good=good, bad=bad)
     resp = call_openrouter(
         [{"role": "system", "content": GEN_SYS}, {"role": "user", "content": user}],
         model=model,
