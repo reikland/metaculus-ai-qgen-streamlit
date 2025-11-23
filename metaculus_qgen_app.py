@@ -84,8 +84,6 @@ def call_openrouter_raw(
     retries: int = 3,
 ) -> str:
     """Appel brut à OpenRouter, retourne simplement le texte de réponse."""
-    import json as _json
-
     payload = {
         "model": model,
         "messages": messages,
@@ -134,16 +132,20 @@ def call_openrouter_raw(
 GEN_SYS = """
 You generate forecasting questions in a STRICT, line-based text template.
 
-Rules (CRITICAL):
+You are a deterministic template-filling engine. Formatting rules are CRITICAL:
 - Do NOT use markdown, bullets, JSON, or code fences.
 - Do NOT add any commentary before the first question or after the last one.
-- All fields must be on ONE line (no internal line breaks).
+- All fields must be on ONE line (no internal line breaks inside values).
 - You MUST respect the template exactly, with the same field labels and order.
+- You MUST output exactly N question blocks labelled QUESTION 1, QUESTION 2, ..., QUESTION N.
+
+All questions MUST be binary (YES/NO) with clearly defined conditions.
+The field "Answer-type" MUST ALWAYS be exactly: binary
 """.strip()
 
 GEN_USER_TMPL = textwrap.dedent(
     """
-    Task: Generate {n} Metaculus-style forecasting questions (true questions i.e with a "?" at the end of the sentence).
+    Task: Generate {n} Metaculus-style forecasting questions (true questions with a "?" at the end).
 
     Topic brief (3–6 lines):
     {brief}
@@ -160,9 +162,10 @@ GEN_USER_TMPL = textwrap.dedent(
     Timeframe-start: <YYYY-MM-DD HH:MM:SS UTC or empty if unknown>
     Timeframe-end: <YYYY-MM-DD HH:MM:SS UTC (target resolution time), or empty>
     Timezone: UTC
-    Answer-type: <one of: binary, numeric, date, multiple>
+    Answer-type: binary
 
     Constraints on content:
+    - All questions MUST be binary YES/NO, resolved by a clear condition in the Resolution field.
     - Outcomes must be resolvable from public sources (official statistics, reputable newswires, etc.).
     - Include explicit end dates (UTC) when possible and clear thresholds.
     - Questions should be PLAUSIBLE: numeric thresholds, dates and quantities must be in realistic
@@ -240,7 +243,7 @@ def mock_questions(brief: str, n: int) -> List[Dict[str, Any]]:
         out.append(
             {
                 "title": f"[MOCK] {prefix} – Q{i+1}",
-                "body": "This is a mock question body for testing the UI.",
+                "body": "This is a mock binary question body for testing the UI, ending with a question?",
                 "resolution": (
                     "On 2030-12-31 23:59:59 UTC, check source X; "
                     "resolve YES if condition Y holds, otherwise NO."
@@ -335,43 +338,43 @@ def parse_judge_line(line: str) -> Dict[str, Any]:
     clarity=X; operationalization=Y; plausibility=Z; usefulness=U; safety=S; overall=O; notes=TEXT
     """
     line = line.strip()
-    # On sépare sur ';' mais en gardant tout ce qui dépasse pour notes
     parts = [p.strip() for p in line.split(";")]
-    # On veut au moins 6 segments pour les scores, le reste = notes
     if len(parts) < 6:
         raise ValueError(f"Judge line too short: {line!r}")
 
     mapping: Dict[str, Any] = {}
+
     def parse_val(segment: str) -> (str, str):
         if "=" not in segment:
             return segment.strip().lower(), ""
         k, v = segment.split("=", 1)
         return k.strip().lower(), v.strip()
 
-    # clarity, operationalization, plausibility, usefulness, safety, overall
-    keys_expected = ["clarity", "operationalization", "plausibility",
-                     "usefulness", "safety", "overall"]
+    keys_expected = [
+        "clarity",
+        "operationalization",
+        "plausibility",
+        "usefulness",
+        "safety",
+        "overall",
+    ]
 
     for i, key_name in enumerate(keys_expected):
         if i >= len(parts):
             break
         k, v = parse_val(parts[i])
         if k != key_name:
-            # clé inattendue, on essaie quand même d'interpréter
             k = key_name
         mapping[k] = v
 
-    # notes = le reste
     if len(parts) > len(keys_expected):
         notes_raw = ";".join(parts[len(keys_expected):]).strip()
-        # enlever éventuel "notes=" au début
         if notes_raw.lower().startswith("notes="):
             notes_raw = notes_raw[6:].strip()
         mapping["notes"] = notes_raw
     else:
         mapping["notes"] = ""
 
-    # Convertir les scores
     def to_int(name: str, default: int = 3) -> int:
         try:
             return int(round(float(mapping.get(name, default))))
@@ -419,39 +422,69 @@ def generate_questions(
     n: int,
     model: str,
     dry_run: bool = False,
+    max_attempts: int = 3,
 ) -> Dict[str, Any]:
     """
     Génère des questions au format texte structuré, puis parse en liste de dicts.
+    Utilise plusieurs tentatives si le modèle ne renvoie pas assez de questions.
     """
     if dry_run:
         qs = mock_questions(brief, n)
-        return {"model": "[MOCK]", "questions": qs, "raw_output": "(mock)"}
+        return {
+            "model": "[MOCK]",
+            "questions": qs,
+            "raw_output": "(mock)",
+            "n_requested": n,
+            "n_parsed": len(qs),
+            "attempts": 1,
+        }
 
-    user = GEN_USER_TMPL.format(
-        n=n,
-        brief=brief,
-        tags=",".join(tags),
-        horizon=horizon,
-    )
+    all_questions: List[Dict[str, Any]] = []
+    raw_chunks: List[str] = []
+    attempts = 0
 
-    raw = call_openrouter_raw(
-        messages=[
-            {"role": "system", "content": GEN_SYS},
-            {"role": "user", "content": user},
-        ],
-        model=model,
-        max_tokens=4000,
-        temperature=0.5,
-    )
+    while len(all_questions) < n and attempts < max_attempts:
+        attempts += 1
+        remaining = n - len(all_questions)
 
-    questions = parse_questions_from_text(raw)
-    if not questions:
-        raise RuntimeError(
-            "Could not parse any questions from model output. "
-            "Check format and model obedience."
+        user = GEN_USER_TMPL.format(
+            n=remaining,
+            brief=brief,
+            tags=",".join(tags),
+            horizon=horizon,
         )
 
-    return {"model": model, "questions": questions, "raw_output": raw}
+        raw = call_openrouter_raw(
+            messages=[
+                {"role": "system", "content": GEN_SYS},
+                {"role": "user", "content": user},
+            ],
+            model=model,
+            max_tokens=4000,
+            temperature=0.0,  # on privilégie l'obéissance au template
+        )
+        raw_chunks.append(raw)
+
+        new_questions = parse_questions_from_text(raw)
+        if not new_questions:
+            continue
+
+        all_questions.extend(new_questions)
+
+    if not all_questions:
+        raise RuntimeError("Could not parse any questions from model outputs.")
+
+    if len(all_questions) > n:
+        all_questions = all_questions[:n]
+
+    return {
+        "model": model,
+        "questions": all_questions,
+        "raw_output": "\n\n----- ATTEMPT SEPARATOR -----\n\n".join(raw_chunks),
+        "n_requested": n,
+        "n_parsed": len(all_questions),
+        "attempts": attempts,
+    }
 
 
 def judge_question(
@@ -466,6 +499,7 @@ def judge_question(
     """
     if dry_run:
         import random
+
         clarity = random.randint(3, 5)
         oper = random.randint(3, 5)
         plaus = random.randint(3, 5)
@@ -640,6 +674,15 @@ if run_button:
 
         if gen_res is not None:
             questions = gen_res["questions"]
+            n_parsed = gen_res.get("n_parsed", len(questions))
+            n_requested = gen_res.get("n_requested", n)
+            attempts = gen_res.get("attempts", 1)
+
+            if n_parsed < n_requested:
+                st.warning(
+                    f"Generator returned only {n_parsed} questions out of requested {n_requested} "
+                    f"after {attempts} attempt(s). Top-K will be at most {n_parsed}."
+                )
 
             with st.spinner("Judging questions..."):
                 try:
@@ -670,6 +713,11 @@ if run_button:
                     "model": model,
                     "entries": entries_sorted,
                     "raw_output": gen_res["raw_output"],
+                    "n_parsed": n_parsed,
+                    "n_requested": n_requested,
+                    "top_k_requested": top_k,
+                    "top_k_effective": effective_k,
+                    "attempts": attempts,
                 }
             else:
                 res = None
@@ -688,6 +736,11 @@ if res is not None:
     model = res["model"]
     entries = res["entries"]
     raw_output = res["raw_output"]
+    n_parsed = res.get("n_parsed")
+    n_requested = res.get("n_requested")
+    top_k_requested = res.get("top_k_requested")
+    top_k_effective = res.get("top_k_effective")
+    attempts = res.get("attempts", 1)
 
     st.subheader("Model used")
     st.write(model)
@@ -720,6 +773,11 @@ if res is not None:
     df = df.sort_values("overall", ascending=False)
 
     st.subheader("Top-K judged questions")
+    st.caption(
+        f"Parsed {n_parsed} / requested {n_requested} questions "
+        f"after {attempts} attempt(s). "
+        f"Top-K requested = {top_k_requested}, showing {top_k_effective}."
+    )
     st.dataframe(df, use_container_width=True, height=500)
 
     top = df.iloc[0]
@@ -757,6 +815,7 @@ if res is not None:
             }
         )
     import json as _json
+
     json_bytes = _json.dumps(
         {"model": model, "entries": export_list},
         ensure_ascii=False,
