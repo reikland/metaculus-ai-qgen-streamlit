@@ -1,152 +1,61 @@
-import os, time, csv, json, requests, itertools, random, re, io, tempfile, textwrap
-from typing import Dict, Any, List, Optional, Tuple
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import json
+import re
+import io
+import time
+import textwrap
+from typing import Dict, Any, List, Optional
+
+import requests
 import pandas as pd
 import streamlit as st
 
+# ============================================================
+# 1. CONFIG
+# ============================================================
+
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODELS = "https://openrouter.ai/api/v1/models"
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "").strip()
+OPENROUTER_MODEL_ENV = os.environ.get("OPENROUTER_MODEL", "").strip()
+
 REFERER = "https://localhost"
-TITLE = "Metaculus AI Question Generation - Panel v1"
-PREFERRED_MODELS = [
-    "openai/gpt-4o-mini",
-    "openai/gpt-4.1-mini",
-    "openai/gpt-4.1",
-    "anthropic/claude-3.5-sonnet",
-    "qwen/qwen-2.5-32b-instruct",
-    "qwen/qwen-2.5-7b-instruct",
-    "mistralai/mistral-large-2411",
-    "mistralai/mistral-7b-instruct:free",
-    "google/gemma-2-9b-it:free",
-]
+TITLE = "Metaculus – Question Generator + Judge"
 
-METACULUS_API2 = "https://www.metaculus.com/api2"
-METACULUS_UA = {"User-Agent": "metaculus-question-scraper/0.1 (+python-requests)"}
-METACULUS_HTTP = requests.Session()
+DEFAULT_MODEL = "openai/gpt-4o-mini"
+
+# Stocke le dernier résultat pour éviter les resets
+if "qgen_result" not in st.session_state:
+    st.session_state["qgen_result"] = None
 
 
-def mc_get(url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    r = METACULUS_HTTP.get(url, params=params or {}, headers=METACULUS_UA, timeout=30)
-    if r.status_code == 429:
-        wait = float(r.headers.get("Retry-After", "1") or 1)
-        time.sleep(min(wait, 10))
-        r = METACULUS_HTTP.get(url, params=params or {}, headers=METACULUS_UA, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-
-def fetch_metaculus_recent_questions(n_questions: int = 20, page_limit: int = 80) -> List[Dict[str, Any]]:
-    data = mc_get(f"{METACULUS_API2}/questions/", {"status": "open", "limit": page_limit})
-    results = data.get("results") or data.get("data") or []
-
-    def ts(q: Dict[str, Any]) -> str:
-        return (
-            q.get("open_time")
-            or q.get("created_time")
-            or q.get("created_at")
-            or q.get("scheduled_close_time")
-            or ""
-        )
-
-    results.sort(key=ts, reverse=True)
-    out: List[Dict[str, Any]] = []
-    for q in results[:n_questions]:
-        qid = q.get("id")
-        if not qid:
-            continue
-        title = q.get("title") or f"Question {qid}"
-        body = (
-            q.get("description")
-            or q.get("body")
-            or q.get("background")
-            or q.get("text")
-            or ""
-        )
-        resolution_criteria = (
-            q.get("resolution_criteria")
-            or q.get("resolution")
-            or q.get("resolution_text")
-            or ""
-        )
-        open_time = q.get("open_time") or ""
-        close_time = q.get("close_time") or q.get("scheduled_close_time") or ""
-        timeframe = f"{open_time} -> {close_time}".strip(" ->")
-        answer_type = (
-            q.get("possibility_type")
-            or q.get("possibility_space")
-            or q.get("type")
-            or ""
-        )
-        url = (
-            q.get("page_url")
-            or q.get("url")
-            or f"https://www.metaculus.com/questions/{qid}/"
-        )
-        out.append(
-            {
-                "id": qid,
-                "url": url,
-                "title": title,
-                "body": body,
-                "resolution_criteria": resolution_criteria,
-                "timeframe": timeframe,
-                "answer_type": answer_type,
-            }
-        )
-    return out
-
-
-def scrape_metaculus_examples_to_csv(n: int, out_path: Optional[str] = None) -> str:
-    n = max(10, min(n, 50))
-    if out_path is None:
-        fd, path = tempfile.mkstemp(suffix=".csv")
-        os.close(fd)
-        out_path = path
-    qs = fetch_metaculus_recent_questions(n_questions=n, page_limit=max(80, n))
-    fieldnames = [
-        "id",
-        "url",
-        "title",
-        "body",
-        "resolution_criteria",
-        "timeframe",
-        "answer_type",
-    ]
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for q in qs:
-            w.writerow(
-                {
-                    "id": q.get("id", ""),
-                    "url": q.get("url", ""),
-                    "title": q.get("title", ""),
-                    "body": q.get("body", ""),
-                    "resolution_criteria": q.get("resolution_criteria", ""),
-                    "timeframe": q.get("timeframe", ""),
-                    "answer_type": q.get("answer_type", ""),
-                }
-            )
-    return out_path
-
+# ============================================================
+# 2. OPENROUTER HELPERS
+# ============================================================
 
 def get_openrouter_key() -> str:
+    """Récupère la clé OpenRouter depuis la sidebar, l'env ou Streamlit secrets."""
     try:
         v = st.session_state.get("OPENROUTER_API_KEY_OVERRIDE", "").strip()
     except Exception:
         v = ""
+
     if not v:
         v = os.environ.get("OPENROUTER_API_KEY", "").strip()
+
     if not v:
         try:
             if "OPENROUTER_API_KEY" in st.secrets:
                 v = str(st.secrets["OPENROUTER_API_KEY"]).strip()
         except Exception:
             pass
+
     return v
 
 
 def ascii_safe(s: str) -> str:
+    """Encode en ASCII safe pour les headers HTTP."""
     try:
         return s.encode("latin-1", "ignore").decode("latin-1")
     except Exception:
@@ -154,6 +63,7 @@ def ascii_safe(s: str) -> str:
 
 
 def or_headers() -> Dict[str, str]:
+    """Headers standards OpenRouter."""
     key = get_openrouter_key()
     if not key:
         raise RuntimeError("Missing OPENROUTER_API_KEY")
@@ -163,64 +73,62 @@ def or_headers() -> Dict[str, str]:
         "Accept": "application/json",
         "Referer": ascii_safe(REFERER),
         "X-Title": ascii_safe(TITLE),
-        "User-Agent": ascii_safe("metaculus-ai-qgen/1.2"),
+        "User-Agent": ascii_safe("metaculus-qgen-judge/0.1"),
     }
 
 
-def list_models_raw() -> List[Dict[str, Any]]:
-    r = requests.get(OPENROUTER_MODELS, headers=or_headers(), timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("data") or data.get("models") or []
+def call_openrouter_raw(
+    messages: List[Dict[str, str]],
+    model: str,
+    max_tokens: int = 2000,
+    temperature: float = 0.4,
+    retries: int = 3,
+) -> str:
+    """Appel brut à OpenRouter, retourne simplement le texte de réponse."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "top_p": 1,
+        "max_tokens": max_tokens,
+    }
+
+    last_error: Optional[Exception] = None
+
+    for k in range(retries):
+        try:
+            r = requests.post(
+                OPENROUTER_URL,
+                headers=or_headers(),
+                json=payload,
+                timeout=120,
+            )
+            if r.status_code == 429:
+                retry_after = float(r.headers.get("Retry-After", "2") or 2)
+                time.sleep(min(retry_after, 10))
+                continue
+
+            r.raise_for_status()
+            data = r.json()
+            if "error" in data:
+                raise RuntimeError(str(data["error"]))
+
+            choices = data.get("choices") or []
+            if not choices:
+                raise RuntimeError("No choices in OpenRouter response")
+
+            content = choices[0].get("message", {}).get("content", "")
+            return content or ""
+        except Exception as e:
+            last_error = e
+            time.sleep(0.8 * (k + 1))
+
+    raise RuntimeError(f"[openrouter] giving up after retries: {repr(last_error)}")
 
 
-def list_models_clean() -> List[Dict[str, Any]]:
-    try:
-        ms = list_models_raw()
-    except Exception:
-        return []
-    out = []
-    for m in ms:
-        out.append(
-            {
-                "id": m.get("id"),
-                "name": m.get("name"),
-                "context_length": m.get("context_length") or m.get("max_context_length"),
-                "pricing": m.get("pricing") or {},
-                "tags": m.get("tags") or [],
-                "arch": m.get("architecture"),
-            }
-        )
-    return out
-
-
-def pick_model() -> str:
-    if OPENROUTER_MODEL:
-        return OPENROUTER_MODEL
-    ms = list_models_clean()
-    if ms:
-        ids = {m.get("id"): m for m in ms if m.get("id")}
-        for mid in PREFERRED_MODELS:
-            if mid in ids:
-                return mid
-        best_id, best_price = None, 1e9
-        for m in ms:
-            mid = (m.get("id") or "").lower()
-            tags = " ".join((m.get("tags") or [])).lower()
-            arch = (m.get("arch") or "").lower()
-            if ("instruct" in mid) or ("instruct" in tags) or ("instruct" in arch):
-                pr = m.get("pricing") or {}
-                p = pr.get("prompt") or pr.get("input") or 0.0
-                try:
-                    p = float(p) if p else 0.0
-                except Exception:
-                    p = 0.0
-                if p < best_price:
-                    best_price, best_id = p, m.get("id") or ""
-        if best_id:
-            return best_id
-    return PREFERRED_MODELS[0]
-
+# ============================================================
+# 3. JSON PARSING – SIMPLE & ROBUST
+# ============================================================
 
 def extract_code_fence(s: str) -> Optional[str]:
     m = re.search(r"```(?:json)?\s*(.*?)\s*```", s, flags=re.DOTALL | re.IGNORECASE)
@@ -241,35 +149,52 @@ def balanced_slice(s: str, open_char: str, close_char: str) -> Optional[str]:
         elif c == close_char:
             depth -= 1
             if depth == 0:
-                return s[start : i + 1]
+                return s[start:i+1]
     return None
 
 
-def parse_json_relaxed(s: str, expect: str = "auto") -> Any:
+def parse_json_relaxed(s: str) -> Any:
+    """
+    Essaie fort de récupérer un JSON valide depuis la sortie du modèle.
+
+    On :
+    - enlève les ``` et "json",
+    - supprime les virgules finales avant } ou ],
+    - tente de parser la chaîne entière,
+    - sinon, on essaie de trouver un bloc [ ... ] ou { ... } équilibré.
+    """
     s = s.strip()
+
+    # Enlève les fences éventuelles
+    s = re.sub(r"```(?:json)?", "", s, flags=re.IGNORECASE)
+    s = s.replace("```", "")
+
+    # Supprime les virgules finales avant } ou ]
+    s = re.sub(r",(\s*[}\]])", r"\1", s)
+
+    # 1) tentative directe
     try:
         return json.loads(s)
     except Exception:
         pass
-    fence = extract_code_fence(s)
-    if fence:
+
+    # 2) bloc array
+    blk = balanced_slice(s, "[", "]")
+    if blk:
         try:
-            return json.loads(fence)
+            return json.loads(blk)
         except Exception:
-            s = fence
-    if expect in ("array", "auto"):
-        blk = balanced_slice(s, "[", "]")
-        if blk:
-            try:
-                return json.loads(blk)
-            except Exception:
-                pass
+            pass
+
+    # 3) bloc objet
     blk = balanced_slice(s, "{", "}")
     if blk:
         try:
             return json.loads(blk)
         except Exception:
             pass
+
+    # 4) chaque { ... } individuellement
     objs = []
     for m in re.finditer(r"\{.*?\}", s, flags=re.DOTALL):
         try:
@@ -278,455 +203,636 @@ def parse_json_relaxed(s: str, expect: str = "auto") -> Any:
             continue
     if objs:
         return objs if len(objs) > 1 else objs[0]
+
     raise ValueError("Could not parse JSON from model output")
 
 
-def call_openrouter(messages: List[Dict[str, str]], model: str, max_tokens: int = 2000, temperature: float = 0.2, retries: int = 3, expect: str = "auto") -> Any:
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "top_p": 1,
-        "max_tokens": max_tokens,
-    }
-    last = None
-    for k in range(retries):
-        try:
-            r = requests.post(OPENROUTER_URL, headers=or_headers(), json=payload, timeout=120)
-            if r.status_code == 404:
-                raise RuntimeError("404 No endpoints for model")
-            if r.status_code == 429:
-                retry_after = float(r.headers.get("Retry-After", "2") or 2)
-                time.sleep(min(retry_after, 10))
-                continue
-            r.raise_for_status()
-            data = r.json()
-            if "error" in data:
-                raise RuntimeError(str(data["error"]))
-            ch = data.get("choices") or []
-            if not ch:
-                raise RuntimeError("No choices in response")
-            content = ch[0].get("message", {}).get("content", "")
-            if not content:
-                raise RuntimeError("Empty content")
-            return parse_json_relaxed(content, expect=expect)
-        except Exception as e:
-            last = e
-            time.sleep(0.8 * (k + 1))
-    raise RuntimeError(f"[openrouter] giving up after retries: {repr(last)}")
+# ============================================================
+# 4. PROMPTS – GÉNÉRATION + JUGE (PLAUDIBILITÉ)
+# ============================================================
 
+GEN_SYS = """
+You are a JSON API, not a chat assistant.
 
-def load_examples_csv(path: str, k_good: int = 3, k_bad: int = 2) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    if not path or not os.path.exists(path):
-        return [], []
-    goods, bads = [], []
-    with open(path, "r", encoding="utf-8") as f:
-        rd = csv.DictReader(f)
-        rows = list(rd)
+Your ONLY task is to output machine-readable JSON that can be parsed by json.loads in Python
+and JSON.parse in JavaScript without any preprocessing.
 
-    def is_good(r: Dict[str, Any]) -> bool:
-        t = (r.get("resolution_criteria") or r.get("resolution") or "").lower()
-        return ("utc" in t or " by " in t or " on " in t) and ("will " in (r.get("title", "").lower()))
+Hard constraints:
+- Output EXACTLY ONE JSON value, which MUST be a JSON array of objects.
+- NO text before or after the array.
+- NO markdown, NO code fences, NO comments, NO explanations.
+- Use only double quotes for strings. Never use single quotes.
+- Never include trailing commas.
+- Allowed literals: null, true, false, numbers, strings, arrays, objects.
+- Never output NaN, Infinity, or -Infinity.
 
-    def row2obj(r: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "title": r.get("title") or r.get("question_title") or "",
-            "body": r.get("body") or r.get("background") or "",
-            "resolution_criteria": r.get("resolution_criteria") or r.get("resolution") or "",
-            "timeframe": r.get("timeframe") or r.get("end") or "",
-            "answer_type": r.get("answer_type") or "",
-        }
+If you violate these constraints, the calling application will fail.
+Return STRICT JSON only.
+""".strip()
 
-    random.shuffle(rows)
-    for r in rows:
-        o = row2obj(r)
-        if not o["title"]:
-            continue
-        if is_good(r) and len(goods) < k_good:
-            goods.append(o)
-        elif not is_good(r) and len(bads) < k_bad:
-            bads.append(o)
-        if len(goods) >= k_good and len(bads) >= k_bad:
-            break
-    return goods, bads
-
-
-GEN_SYS = "You are a senior Metaculus question writer. Return STRICT JSON only."
 GEN_USER_TMPL = textwrap.dedent(
     """
-    Task: Generate {n} candidate forecasting questions matching Metaculus style.
+    Task: Generate {n} Metaculus-style forecasting questions.
 
     Topic brief (3–6 lines):
     {brief}
 
-    Domain tags: {tags} | Target horizon (if relevant): {horizon}
+    Domain tags: {tags}
+    Target horizon (if relevant): {horizon}
 
-    For EACH candidate, output an object with:
-    "title", "body", "resolution_criteria", "timeframe":{{"start":"...","end":"...","timezone":"UTC"}},
-    "canonical_source": ["Publisher names or URLs allowed"], "answer_type": "binary|numeric|date|multiple",
-    "proposed_bins_or_ranges": "...(if numeric)", "difficulty": "low|med|high",
-    "rationale": "why decision-relevant and non-trivial", "policy_notes": "safety/legal notes".
+    For EACH question, output an object with EXACTLY these keys:
+      - "title": short, <= 100 characters
+      - "body": 2–5 sentences describing context
+      - "resolution_criteria": exact steps to decide YES/NO or measure the outcome
+      - "timeframe": an object with "start", "end", "timezone" (ISO-like strings, timezone = "UTC")
+      - "answer_type": one of "binary", "numeric", "date", "multiple"
 
-    Constraints:
-    - Outcomes must be independently verifiable from public sources; cite canonical_source (publishers allowed; URLs optional).
-    - Include explicit end dates (UTC) and exact resolution checks; avoid vague terms unless thresholded.
-    - If you have tools or internet access, research current figures/dates and cite the sources you rely on.
-    - Title ≤ 100 chars; body 2–5 concise sentences.
-    - Return a STRICT JSON array of {n} objects; no commentary, no markdown fences. If you add prose/fences, output will be discarded.
+    Substantive constraints:
+    - Outcomes must be resolvable from public sources (official statistics, reputable newswires, etc.).
+    - Include explicit end dates (UTC) and clear thresholds.
+    - Questions should be PLAUSIBLE: numeric thresholds, dates and quantities must be in realistic
+      ranges consistent with current public information and known orders of magnitude.
+      Avoid arbitrary or random-looking numbers (e.g. "17,345,678,901") when you have no basis.
+      If you are uncertain, prefer:
+        - ranges ("between 10% and 30%"),
+        - relative comparisons ("higher than in 2024"),
+        - or coarse thresholds (e.g. "above 3× the 2024 value"),
+      instead of a very specific figure that is likely to be wrong.
+    - If you have internet/tools, you MAY look up up-to-date facts, but still output only JSON.
+    - Avoid questions already resolved at time of writing; there must be genuine uncertainty.
 
-    Few-shot good examples:
-    {good_examples}
+    OUTPUT FORMAT (CRITICAL):
+    - Return a SINGLE JSON ARRAY of EXACTLY {n} objects.
+    - Do NOT wrap it in markdown.
+    - Do NOT add any explanation or commentary.
+    - Do NOT include trailing commas.
 
-    Few-shot bad/avoid examples (with reasons to avoid):
-    {bad_examples}
+    Example of the STRUCTURE only (values are placeholders, but this is valid JSON):
+    [
+      {{
+        "title": "Example question title",
+        "body": "Example body text.",
+        "resolution_criteria": "How the question will be resolved.",
+        "timeframe": {{
+          "start": "2025-01-01 00:00:00",
+          "end": "2030-12-31 23:59:59",
+          "timezone": "UTC"
+        }},
+        "answer_type": "binary"
+      }}
+    ]
     """
 )
 
-CRIT_SYS = "You are a meticulous Metaculus question editor. Return STRICT JSON."
-CRIT_USER_TMPL = """Given this candidate JSON, rate 1–5 on each dimension:
-clarity, falsifiability, operationalization, usefulness, safety.
-List 3 concrete edits to raise any score <5. Then return a revised candidate.
+JUDGE_SYS = """
+You are a JSON API, not a chat assistant.
 
-Return:
-{{
- "scores": {{...}},
- "edits": ["...","...","..."],
- "revised_candidate": {{...}}
-}}
+You score candidate forecasting questions.
 
-Candidate:
-{candidate_json}
-"""
+Your ONLY task is to output machine-readable JSON that can be parsed by json.loads in Python
+and JSON.parse in JavaScript without any preprocessing.
 
-JUDGE_SYS = "You are a strict Metaculus adjudicator. Return STRICT JSON only."
-JUDGE_USER_TMPL = """Apply this rubric (1–5 each): clarity, falsifiability, operationalization, usefulness, safety.
-Give overall (mean) and short notes. Return:
-{{"scores":{{"clarity":int,"falsifiability":int,"operationalization":int,"usefulness":int,"safety":int}},"overall":X.X,"blockers":["..."],"notes":"..."}}
+Constraints:
+- Output EXACTLY ONE JSON object.
+- NO markdown, NO code fences, NO comments, NO explanations.
+- Use only double quotes for strings. Never use single quotes.
+- Never include trailing commas, NaN, Infinity, or -Infinity.
 
-Candidate:
-{candidate_json}
-"""
+Return STRICT JSON only.
+""".strip()
 
-PAIRWISE_SYS = "You are a strict adjudicator. Return STRICT JSON only."
-PAIRWISE_USER_TMPL = """Compare Candidate A vs B for expected forecasting value to Metaculus users,
-holding to the rubric. Pick a winner in {{"winner":"A"|"B","reason":"≤2 lines"}}.
+JUDGE_USER_TMPL = textwrap.dedent(
+    """
+    Evaluate the following forecasting question for Metaculus-style use.
 
-A:
-{A}
+    You MUST return a SINGLE JSON object with EXACTLY these keys:
+      - "clarity": integer from 1 to 5
+      - "operationalization": integer from 1 to 5 (how well it can be mechanically resolved)
+      - "plausibility": integer from 1 to 5 (are the numbers, dates, and scenarios realistic and
+        consistent with known orders of magnitude, not obviously pulled from thin air?)
+      - "usefulness": integer from 1 to 5 (decision/forecasting value)
+      - "safety": integer from 1 to 5 (no obvious policy/abuse/harassment issues)
+      - "overall": float from 1 to 5 (mean of the 5 scores, rounded to 2 decimals)
+      - "notes": a short justification string (<= 300 characters)
 
-B:
-{B}
-"""
+    Example of valid JSON output (values are illustrative only):
+    {{
+      "clarity": 5,
+      "operationalization": 4,
+      "plausibility": 4,
+      "usefulness": 5,
+      "safety": 5,
+      "overall": 4.60,
+      "notes": "Clear question; uses realistic ranges and resolvable statistics."
+    }}
+
+    Remember:
+    - Do NOT output markdown or code fences.
+    - Do NOT include comments or trailing commas.
+
+    Candidate question (JSON):
+    {candidate_json}
+    """
+)
 
 
-def _build_generation_prompt(brief: str, tags: List[str], horizon: str, n: int, good: List[Dict[str, Any]], bad: List[Dict[str, Any]]) -> str:
-    good_str = json.dumps(good, ensure_ascii=False) if good else "[]"
-    bad_str = json.dumps(bad, ensure_ascii=False) if bad else "[]"
-    return GEN_USER_TMPL.format(
-        n=n,
-        brief=brief,
-        tags=",".join(tags),
-        horizon=horizon,
-        good_examples=good_str,
-        bad_examples=bad_str,
-    )
+# ============================================================
+# 5. CORE GENERATION LOGIC
+# ============================================================
 
-
-def _mock_candidates(brief: str, n: int) -> List[Dict[str, Any]]:
+def mock_questions(brief: str, n: int) -> List[Dict[str, Any]]:
+    """Mode démo sans API : fabrique des questions factices."""
     out: List[Dict[str, Any]] = []
+    prefix = brief.strip().split("\n")[0][:60] or "Example topic"
     for i in range(n):
         out.append(
             {
-                "title": f"[MOCK] {brief[:40]} — Q{i+1}",
-                "body": "Context lines. Why it matters. Actors involved.",
-                "resolution_criteria": "On 2030-12-31 23:59:59 UTC, check source X for Y; YES if Z; otherwise NO.",
+                "title": f"[MOCK] {prefix} – Q{i+1}",
+                "body": "This is a mock question body for testing the UI.",
+                "resolution_criteria": (
+                    "On 2030-12-31 23:59:59 UTC, check source X; "
+                    "resolve YES if condition Y holds, otherwise NO."
+                ),
                 "timeframe": {
-                    "start": "2026-01-01 00:00:00",
+                    "start": "2025-01-01 00:00:00",
                     "end": "2030-12-31 23:59:59",
                     "timezone": "UTC",
                 },
-                "canonical_source": ["Reuters", "official press release"],
                 "answer_type": "binary",
-                "proposed_bins_or_ranges": "",
-                "difficulty": "med",
-                "rationale": "Decision-relevant; not trivially predictable.",
-                "policy_notes": "",
             }
         )
     return out
 
 
-def generate_candidates(brief: str, tags: List[str], horizon: str, n: int, good: List[Dict[str, Any]], bad: List[Dict[str, Any]], model: str, dry_run: bool = False) -> List[Dict[str, Any]]:
+def generate_questions(
+    brief: str,
+    tags: List[str],
+    horizon: str,
+    n: int,
+    model: str,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """
+    Génère des questions, sans étape intermédiaire.
+    Retourne un dict avec :
+      - "model"
+      - "questions" (liste d'objets normalisés)
+      - "raw_output" (texte brut du modèle, pour debug)
+    """
     if dry_run:
-        return _mock_candidates(brief, n)
+        qs = mock_questions(brief, n)
+        return {"model": "[MOCK]", "questions": qs, "raw_output": "(mock)"}
 
-    user = _build_generation_prompt(brief=brief, tags=tags, horizon=horizon, n=n, good=good, bad=bad)
-    resp = call_openrouter(
-        [{"role": "system", "content": GEN_SYS}, {"role": "user", "content": user}],
+    user = GEN_USER_TMPL.format(
+        n=n,
+        brief=brief,
+        tags=",".join(tags),
+        horizon=horizon,
+    )
+
+    raw = call_openrouter_raw(
+        messages=[
+            {"role": "system", "content": GEN_SYS},
+            {"role": "user", "content": user},
+        ],
         model=model,
         max_tokens=4000,
         temperature=0.5,
-        expect="array",
     )
-    if isinstance(resp, list):
-        return resp
-    if isinstance(resp, dict) and "candidates" in resp and isinstance(resp["candidates"], list):
-        return resp["candidates"]
-    if isinstance(resp, dict):
-        return [resp]
-    raise RuntimeError("Generation returned unexpected shape")
+
+    try:
+        data = parse_json_relaxed(raw)
+    except Exception as e:
+        snippet = raw[:600].replace("\n", "\\n")
+        raise RuntimeError(
+            f"Model output was not valid JSON: {e}. "
+            f"First 600 chars: {snippet!r}"
+        ) from e
+
+    # ======================================================
+    # Normalisation de la forme du JSON -> liste de questions
+    # ======================================================
+    questions: List[Dict[str, Any]] = []
+
+    if isinstance(data, list):
+        # Cas idéal : le modèle renvoie déjà un tableau
+        questions = data
+
+    elif isinstance(data, dict):
+        # 1) Clé "questions"
+        if isinstance(data.get("questions"), list):
+            questions = data["questions"]
+        else:
+            # 2) Chercher une valeur qui soit une liste de dicts
+            for v in data.values():
+                if isinstance(v, list) and v and isinstance(v[0], dict):
+                    questions = v
+                    break
+
+            # 3) Sinon, interpréter le dict lui-même comme UNE question
+            if not questions:
+                questions = [data]
+    else:
+        raise RuntimeError(
+            f"Parsed JSON is neither an array nor an object; got type {type(data).__name__}."
+        )
+
+    # ==========================================
+    # Normalisation champ par champ des questions
+    # ==========================================
+    norm_questions: List[Dict[str, Any]] = []
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        tf = q.get("timeframe") or {}
+        if not isinstance(tf, dict):
+            tf = {}
+        norm_questions.append(
+            {
+                "title": q.get("title", ""),
+                "body": q.get("body", ""),
+                "resolution_criteria": q.get("resolution_criteria", ""),
+                "timeframe": {
+                    "start": tf.get("start", ""),
+                    "end": tf.get("end", ""),
+                    "timezone": tf.get("timezone", ""),
+                },
+                "answer_type": q.get("answer_type", ""),
+            }
+        )
+
+    if not norm_questions:
+        raise RuntimeError("No valid question objects found in JSON.")
+
+    return {"model": model, "questions": norm_questions, "raw_output": raw}
 
 
-def critique_and_revise(cand: Dict[str, Any], model: str, dry_run: bool = False) -> Tuple[Dict[str, Any], Dict[str, int]]:
+# ============================================================
+# 6. JUDGE LOGIC (SCORE + TOP K)
+# ============================================================
+
+def judge_question(
+    question: Dict[str, Any],
+    model: str,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """
+    Retourne un dict avec les clés :
+      "clarity", "operationalization", "plausibility",
+      "usefulness", "safety", "overall", "notes".
+    """
     if dry_run:
-        return cand, {
-            "clarity": 4,
-            "falsifiability": 4,
-            "operationalization": 4,
-            "usefulness": 4,
-            "safety": 5,
-        }
-    user = CRIT_USER_TMPL.format(candidate_json=json.dumps(cand, ensure_ascii=False))
-    resp = call_openrouter(
-        [{"role": "system", "content": CRIT_SYS}, {"role": "user", "content": user}],
-        model=model,
-        max_tokens=2000,
-        temperature=0.1,
-        expect="object",
-    )
-    revised = resp.get("revised_candidate") or cand
-    scores = {k.lower(): int(round(float(v))) for k, v in (resp.get("scores") or {}).items()}
-    return revised, scores
-
-
-def judge(cand: Dict[str, Any], model: str, dry_run: bool = False) -> Dict[str, Any]:
-    if dry_run:
-        base = 3.6 + random.random() * 1.0
+        import random
+        clarity = random.randint(3, 5)
+        operationalization = random.randint(3, 5)
+        plausibility = random.randint(3, 5)
+        usefulness = random.randint(3, 5)
+        safety = 5
+        overall = round(
+            (clarity + operationalization + plausibility + usefulness + safety) / 5.0,
+            2,
+        )
         return {
-            "scores": {
-                "clarity": 4,
-                "falsifiability": 4,
-                "operationalization": 4,
-                "usefulness": 4,
-                "safety": 5,
-            },
-            "overall": round(min(5.0, base), 2),
-            "blockers": [],
-            "notes": "mock",
+            "clarity": clarity,
+            "operationalization": operationalization,
+            "plausibility": plausibility,
+            "usefulness": usefulness,
+            "safety": safety,
+            "overall": overall,
+            "notes": "Mock scores for dry-run mode.",
         }
-    user = JUDGE_USER_TMPL.format(candidate_json=json.dumps(cand, ensure_ascii=False))
-    resp = call_openrouter(
-        [{"role": "system", "content": JUDGE_SYS}, {"role": "user", "content": user}],
+
+    candidate_json = json.dumps(question, ensure_ascii=False)
+    user = JUDGE_USER_TMPL.format(candidate_json=candidate_json)
+
+    raw = call_openrouter_raw(
+        messages=[
+            {"role": "system", "content": JUDGE_SYS},
+            {"role": "user", "content": user},
+        ],
         model=model,
-        max_tokens=1200,
+        max_tokens=800,
         temperature=0.0,
-        expect="object",
     )
-    resp["overall"] = float(resp.get("overall", 0.0))
-    return resp
 
+    try:
+        data = parse_json_relaxed(raw)
+    except Exception as e:
+        snippet = raw[:400].replace("\n", "\\n")
+        raise RuntimeError(
+            f"Judge output was not valid JSON: {e}. "
+            f"First 400 chars: {snippet!r}"
+        ) from e
 
-def pairwise_battle(A: Dict[str, Any], B: Dict[str, Any], model: str, dry_run: bool = False) -> str:
-    if dry_run:
-        return "A" if random.random() < 0.5 else "B"
-    user = PAIRWISE_USER_TMPL.format(A=json.dumps(A, ensure_ascii=False), B=json.dumps(B, ensure_ascii=False))
-    resp = call_openrouter(
-        [{"role": "system", "content": PAIRWISE_SYS}, {"role": "user", "content": user}],
-        model=model,
-        max_tokens=400,
-        temperature=0.0,
-        expect="object",
-    )
-    return resp.get("winner", "A")
+    if not isinstance(data, dict):
+        raise RuntimeError("Judge JSON is not an object.")
 
+    def as_int(name: str, default: int = 3) -> int:
+        v = data.get(name, default)
+        try:
+            return int(round(float(v)))
+        except Exception:
+            return default
 
-def run_pipeline_in_memory(brief: str, tags: List[str], horizon: str, n: int = 10, examples_csv: Optional[str] = None, top_k: int = 5, dry_run: bool = False) -> Dict[str, Any]:
-    gen_model = pick_model()
-    judge_model = pick_model()
-    crit_model = pick_model()
-    good, bad = load_examples_csv(examples_csv or "", k_good=3, k_bad=2)
-    cands = generate_candidates(brief, tags, horizon, n, good, bad, gen_model, dry_run=dry_run)
-    revised = []
-    crit_scores = []
-    for c in cands:
-        r, s = critique_and_revise(c, crit_model, dry_run=dry_run)
-        revised.append(r)
-        crit_scores.append(s)
-    judgements = [judge(c, judge_model, dry_run=dry_run) for c in revised]
-    idx = sorted(range(len(judgements)), key=lambda i: -judgements[i].get("overall", 0.0))[: max(2, top_k)]
-    top = [revised[i] for i in idx]
-    top_scores = [judgements[i] for i in idx]
-    wins = {i: 0 for i in range(len(top))}
-    for i, j in itertools.combinations(range(len(top)), 2):
-        w = pairwise_battle(top[i], top[j], judge_model, dry_run=dry_run)
-        if w == "A":
-            wins[i] += 1
-        elif w == "B":
-            wins[j] += 1
-    ranked = [x for _, x in sorted(((wins[i], i) for i in range(len(top))), reverse=True)]
-    top = [top[i] for i in ranked]
-    top_scores = [top_scores[i] for i in ranked]
+    clarity = as_int("clarity")
+    operationalization = as_int("operationalization")
+    plausibility = as_int("plausibility")
+    usefulness = as_int("usefulness")
+    safety = as_int("safety", default=5)
+
+    try:
+        overall = float(data.get("overall", 0.0))
+        if overall <= 0:
+            raise ValueError()
+    except Exception:
+        overall = round(
+            (clarity + operationalization + plausibility + usefulness + safety) / 5.0,
+            2,
+        )
+
+    notes = str(data.get("notes", "") or "")
+
     return {
-        "gen_model": gen_model,
-        "crit_model": crit_model,
-        "judge_model": judge_model,
-        "candidates": top,
-        "judgements": top_scores,
+        "clarity": clarity,
+        "operationalization": operationalization,
+        "plausibility": plausibility,
+        "usefulness": usefulness,
+        "safety": safety,
+        "overall": round(overall, 2),
+        "notes": notes,
     }
 
 
-st.set_page_config(page_title="Metaculus AI Question Generator", page_icon="📊", layout="wide")
+def judge_all_questions(
+    questions: List[Dict[str, Any]],
+    model: str,
+    dry_run: bool = False,
+) -> List[Dict[str, Any]]:
+    scores: List[Dict[str, Any]] = []
+    for q in questions:
+        s = judge_question(q, model=model, dry_run=dry_run)
+        scores.append(s)
+    return scores
 
-st.title("Metaculus AI Question Generation – Panel v1")
+
+# ============================================================
+# 7. STREAMLIT UI
+# ============================================================
+
+st.set_page_config(
+    page_title="Metaculus – Question Generator + Judge",
+    page_icon="📊",
+    layout="wide",
+)
+
+st.title("Metaculus – Question Generator + Judge")
 
 st.markdown(
     """
-This app wraps a Metaculus-style AI question generation pipeline
-around the OpenRouter API, with critique, judging and pairwise ranking.
+Simple pipeline:
+1. Generate N Metaculus-style questions (JSON only).
+2. Score each question on clarity, operationalization, PLAUSIBILITY, usefulness, safety.
+3. Keep the top K questions by overall score.
 """
 )
 
 with st.sidebar:
     st.header("Settings")
-    api_key_input = st.text_input("OpenRouter API key", type="password", help="Key will be kept only in this session.")
+
+    api_key_input = st.text_input(
+        "OpenRouter API key",
+        type="password",
+        help="Key will be kept only in this session.",
+    )
     if api_key_input:
         st.session_state["OPENROUTER_API_KEY_OVERRIDE"] = api_key_input.strip()
-    n = st.slider("Number of candidates to generate", min_value=3, max_value=30, value=10, step=1)
-    top_k = st.slider("Top K after ranking", min_value=2, max_value=10, value=5, step=1)
-    dry_run = st.checkbox("Dry run (no API calls, mock output)", value=False)
-    scrape_n = st.slider("Scrape N Metaculus questions for few-shot examples (0 = none)", min_value=0, max_value=50, value=0, step=5)
-    examples_file = st.file_uploader("Or upload Metaculus example questions CSV", type=["csv"])
+
+    model_override = st.text_input(
+        "OpenRouter model ID",
+        value=OPENROUTER_MODEL_ENV or DEFAULT_MODEL,
+        help=(
+            "Examples: openai/gpt-4o-mini, openai/gpt-5.1, "
+            "anthropic/claude-3.5-sonnet, qwen/qwen-2.5-32b-instruct..."
+        ),
+    )
+
+    n = st.slider(
+        "Number of questions to generate (N)",
+        min_value=1,
+        max_value=20,
+        value=8,
+        step=1,
+    )
+
+    top_k = st.slider(
+        "Top K questions to keep",
+        min_value=1,
+        max_value=20,
+        value=5,
+        step=1,
+    )
+
+    dry_run = st.checkbox(
+        "Dry run (no API calls, mock questions & scores)",
+        value=False,
+    )
 
 current_key = get_openrouter_key()
 if not current_key and not dry_run:
-    st.warning("No OPENROUTER_API_KEY detected. Enter it in the sidebar, or set it as an environment variable / Streamlit secret.")
+    st.warning(
+        "No OPENROUTER_API_KEY detected. Enter it in the sidebar, "
+        "or set it as an environment variable / Streamlit secret."
+    )
 
 st.subheader("Problem setup")
 
 brief = st.text_area(
     "Topic brief (3–6 lines)",
     height=150,
-    placeholder="e.g. medium-term AI capability benchmarks, regulation in the EU/US, deployment race dynamics...",
+    placeholder="Describe the domain, actors, uncertainty and plausible ranges you care about...",
 )
 
-tags_str = st.text_input("Domain tags (comma-separated)", value="ai,policy,geopolitics")
+tags_str = st.text_input(
+    "Domain tags (comma-separated)",
+    value="ai,policy,geopolitics",
+)
 
-horizon = st.text_input("Horizon / resolution description", value="resolve by 2030-12-31 UTC")
+horizon = st.text_input(
+    "Horizon / resolution description",
+    value="resolve by 2035-12-31 UTC",
+)
 
-run_button = st.button("Generate and rank questions")
+run_button = st.button("Generate + Judge questions")
+
+# ------------------------------------------------------------
+# 8. RUN PIPELINE ON BUTTON CLICK
+# ------------------------------------------------------------
 
 if run_button:
-    current_key = get_openrouter_key()
     if not brief.strip():
         st.warning("Please provide at least a short topic brief.")
-    elif not current_key and not dry_run:
+    elif not dry_run and not current_key:
         st.error("No OPENROUTER_API_KEY set and dry_run is disabled.")
     else:
         tags = [t.strip() for t in tags_str.split(",") if t.strip()]
-        examples_path = None
-        if scrape_n > 0:
+        model = (model_override or "").strip() or DEFAULT_MODEL
+
+        with st.spinner("Generating questions..."):
             try:
-                examples_path = scrape_metaculus_examples_to_csv(scrape_n)
-            except Exception as e:
-                st.error(f"Metaculus scraping error: {e}")
-                st.stop()
-        elif examples_file is not None:
-            fd, path = tempfile.mkstemp(suffix=".csv")
-            with os.fdopen(fd, "wb") as f:
-                f.write(examples_file.read())
-            examples_path = path
-        with st.spinner("Running generation, critique, judging and ranking..."):
-            try:
-                res = run_pipeline_in_memory(
+                gen_res = generate_questions(
                     brief=brief,
                     tags=tags,
                     horizon=horizon,
                     n=n,
-                    examples_csv=examples_path,
-                    top_k=top_k,
+                    model=model,
                     dry_run=dry_run,
                 )
             except Exception as e:
-                st.error(f"Pipeline error: {e}")
-                raise
-        st.success("Done")
-        gen_model = res["gen_model"]
-        crit_model = res["crit_model"]
-        judge_model = res["judge_model"]
-        cands = res["candidates"]
-        judgements = res["judgements"]
-        st.subheader("Models used")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Generator model", gen_model)
-        col2.metric("Critique model", crit_model)
-        col3.metric("Judge model", judge_model)
-        rows = []
-        for c, s in zip(cands, judgements):
-            row = {
+                st.error(f"Generation error: {e}")
+                gen_res = None
+
+        if gen_res is not None:
+            questions = gen_res["questions"]
+
+            with st.spinner("Judging questions..."):
+                try:
+                    scores_list = judge_all_questions(
+                        questions=questions,
+                        model=model,
+                        dry_run=dry_run,
+                    )
+                except Exception as e:
+                    st.error(f"Judge error: {e}")
+                    scores_list = None
+
+            if scores_list is not None:
+                # Combine questions + scores, puis tri par overall
+                entries = []
+                for q, s in zip(questions, scores_list):
+                    entries.append({"question": q, "scores": s})
+
+                entries_sorted = sorted(
+                    entries,
+                    key=lambda e: e["scores"]["overall"],
+                    reverse=True,
+                )
+                effective_k = min(len(entries_sorted), top_k)
+                entries_sorted = entries_sorted[:effective_k]
+
+                res = {
+                    "model": model,
+                    "entries": entries_sorted,
+                    "raw_output": gen_res["raw_output"],
+                }
+            else:
+                res = None
+        else:
+            res = None
+
+        st.session_state["qgen_result"] = res
+
+# ------------------------------------------------------------
+# 9. DISPLAY LAST RESULT (PERSISTENT)
+# ------------------------------------------------------------
+
+res = st.session_state.get("qgen_result")
+
+if res is not None:
+    model = res["model"]
+    entries = res["entries"]
+    raw_output = res["raw_output"]
+
+    st.subheader("Model used")
+    st.write(model)
+
+    # Tableau structuré pour affichage / export
+    rows = []
+    for e in entries:
+        q = e["question"]
+        s = e["scores"]
+        tf = q.get("timeframe") or {}
+        rows.append(
+            {
                 "overall": s.get("overall", 0.0),
-                "clarity": (s.get("scores") or {}).get("clarity"),
-                "falsifiability": (s.get("scores") or {}).get("falsifiability"),
-                "operationalization": (s.get("scores") or {}).get("operationalization"),
-                "usefulness": (s.get("scores") or {}).get("usefulness"),
-                "safety": (s.get("scores") or {}).get("safety"),
-                "title": c.get("title", ""),
-                "body": c.get("body", ""),
-                "resolution_criteria": c.get("resolution_criteria", ""),
-                "timeframe_start": (c.get("timeframe") or {}).get("start", ""),
-                "timeframe_end": (c.get("timeframe") or {}).get("end", ""),
-                "timezone": (c.get("timeframe") or {}).get("timezone", ""),
-                "answer_type": c.get("answer_type", ""),
-                "proposed_bins_or_ranges": c.get("proposed_bins_or_ranges", ""),
-                "canonical_source": "; ".join(c.get("canonical_source") or []),
-                "difficulty": c.get("difficulty", ""),
-                "rationale": c.get("rationale", ""),
-                "policy_notes": c.get("policy_notes", ""),
+                "clarity": s.get("clarity"),
+                "operationalization": s.get("operationalization"),
+                "plausibility": s.get("plausibility"),
+                "usefulness": s.get("usefulness"),
+                "safety": s.get("safety"),
+                "title": q.get("title", ""),
+                "body": q.get("body", ""),
+                "resolution_criteria": q.get("resolution_criteria", ""),
+                "timeframe_start": tf.get("start", ""),
+                "timeframe_end": tf.get("end", ""),
+                "timezone": tf.get("timezone", ""),
+                "answer_type": q.get("answer_type", ""),
                 "judge_notes": s.get("notes", ""),
             }
-            rows.append(row)
-        if rows:
-            df = pd.DataFrame(rows)
-            df = df.sort_values("overall", ascending=False)
-            st.subheader("Ranked candidate questions")
-            st.dataframe(df, use_container_width=True, height=500)
-            top_row = df.iloc[0]
-            st.markdown("### Top candidate")
-            st.markdown(f"**Title:** {top_row['title']}")
-            st.markdown(f"**Body:** {top_row['body']}")
-            st.markdown(f"**Resolution criteria:** {top_row['resolution_criteria']}")
-            st.markdown(
-                f"**Timeframe:** {top_row['timeframe_start']} → {top_row['timeframe_end']} ({top_row.get('timezone','UTC')})"
-            )
-            st.markdown(f"**Answer type:** {top_row['answer_type']}")
-            st.markdown(f"**Rationale:** {top_row['rationale']}")
-            if top_row.get("policy_notes"):
-                st.markdown(f"**Policy notes:** {top_row['policy_notes']}")
-            if top_row.get("judge_notes"):
-                st.markdown(f"**Judge notes:** {top_row['judge_notes']}")
-            csv_buf = io.StringIO()
-            df.to_csv(csv_buf, index=False)
-            csv_bytes = csv_buf.getvalue().encode("utf-8")
-            records = []
-            for c, s in zip(cands, judgements):
-                records.append({"candidate": c, "judge": s})
-            jsonl_buf = io.StringIO()
-            for r in records:
-                jsonl_buf.write(json.dumps(r, ensure_ascii=False) + "\n")
-            jsonl_bytes = jsonl_buf.getvalue().encode("utf-8")
-            st.subheader("Download")
-            c1, c2 = st.columns(2)
-            c1.download_button(
-                "Download CSV",
-                data=csv_bytes,
-                file_name="metaculus_ai_qgen_top.csv",
-                mime="text/csv",
-            )
-            c2.download_button(
-                "Download JSONL",
-                data=jsonl_bytes,
-                file_name="metaculus_ai_qgen_top.jsonl",
-                mime="application/json",
-            )
-        else:
-            st.info("No candidates generated.")
+        )
+
+    df = pd.DataFrame(rows)
+    df = df.sort_values("overall", ascending=False)
+
+    st.subheader("Top-K judged questions")
+    st.dataframe(df, use_container_width=True, height=500)
+
+    top = df.iloc[0]
+    st.markdown("### Best question (rank #1)")
+    st.markdown(f"**Title:** {top['title']}")
+    st.markdown(f"**Body:** {top['body']}")
+    st.markdown(f"**Resolution criteria:** {top['resolution_criteria']}")
+    st.markdown(
+        f"**Timeframe:** {top['timeframe_start']} → "
+        f"{top['timeframe_end']} ({top['timezone'] or 'UTC'})"
+    )
+    st.markdown(f"**Answer type:** {top['answer_type']}")
+    st.markdown(
+        f"**Scores:** overall={top['overall']} "
+        f"(clarity={top['clarity']}, operationalization={top['operationalization']}, "
+        f"plausibility={top['plausibility']}, usefulness={top['usefulness']}, "
+        f"safety={top['safety']})"
+    )
+    if top.get("judge_notes"):
+        st.markdown(f"**Judge notes:** {top['judge_notes']}")
+
+    # Downloads
+    st.subheader("Download")
+
+    csv_buf = io.StringIO()
+    df.to_csv(csv_buf, index=False)
+    csv_bytes = csv_buf.getvalue().encode("utf-8")
+
+    export_list = []
+    for e in entries:
+        export_list.append(
+            {
+                "question": e["question"],
+                "scores": e["scores"],
+            }
+        )
+    json_bytes = json.dumps(
+        {"model": model, "entries": export_list},
+        ensure_ascii=False,
+        indent=2,
+    ).encode("utf-8")
+
+    col1, col2 = st.columns(2)
+    col1.download_button(
+        "Download CSV",
+        data=csv_bytes,
+        file_name="metaculus_topK_questions.csv",
+        mime="text/csv",
+    )
+    col2.download_button(
+        "Download JSON",
+        data=json_bytes,
+        file_name="metaculus_topK_questions.json",
+        mime="application/json",
+    )
+
+    # Zone optionnelle pour inspecter la sortie brute du générateur
+    with st.expander("Raw generation output (debug)"):
+        st.code(raw_output, language="json")
+else:
+    st.info("Configure your topic and click 'Generate + Judge questions' to start.")
 
