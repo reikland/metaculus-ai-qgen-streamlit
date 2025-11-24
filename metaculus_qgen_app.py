@@ -3,14 +3,16 @@
 
 import os
 import io
-import re
 import time
 import textwrap
+import random
+import re
 from typing import Dict, Any, List, Optional
 
 import requests
 import pandas as pd
 import streamlit as st
+import json as _json
 
 # ============================================================
 # 1. CONFIG
@@ -20,11 +22,10 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL_ENV = os.environ.get("OPENROUTER_MODEL", "").strip()
 
 REFERER = "https://localhost"
-TITLE = "Metaculus – Question Generator + Judge (Text Template)"
+TITLE = "Metaculus – Proto Question Cluster + Judge + Agent (simple agent)"
 
 DEFAULT_MODEL = "openai/gpt-4o-mini"
 
-# Stocke le dernier résultat pour éviter les resets
 if "qgen_result" not in st.session_state:
     st.session_state["qgen_result"] = None
 
@@ -34,7 +35,6 @@ if "qgen_result" not in st.session_state:
 # ============================================================
 
 def get_openrouter_key() -> str:
-    """Récupère la clé OpenRouter depuis la sidebar, l'env ou Streamlit secrets."""
     try:
         v = st.session_state.get("OPENROUTER_API_KEY_OVERRIDE", "").strip()
     except Exception:
@@ -54,7 +54,6 @@ def get_openrouter_key() -> str:
 
 
 def ascii_safe(s: str) -> str:
-    """Encode en ASCII safe pour les headers HTTP."""
     try:
         return s.encode("latin-1", "ignore").decode("latin-1")
     except Exception:
@@ -62,7 +61,6 @@ def ascii_safe(s: str) -> str:
 
 
 def or_headers() -> Dict[str, str]:
-    """Headers standards OpenRouter."""
     key = get_openrouter_key()
     if not key:
         raise RuntimeError("Missing OPENROUTER_API_KEY")
@@ -72,7 +70,7 @@ def or_headers() -> Dict[str, str]:
         "Accept": "application/json",
         "Referer": ascii_safe(REFERER),
         "X-Title": ascii_safe(TITLE),
-        "User-Agent": ascii_safe("metaculus-qgen-judge-text/0.1"),
+        "User-Agent": ascii_safe("metaculus-proto-qgen-judge-agent/0.5"),
     }
 
 
@@ -83,7 +81,6 @@ def call_openrouter_raw(
     temperature: float = 0.4,
     retries: int = 3,
 ) -> str:
-    """Appel brut à OpenRouter, retourne simplement le texte de réponse."""
     payload = {
         "model": model,
         "messages": messages,
@@ -126,158 +123,208 @@ def call_openrouter_raw(
 
 
 # ============================================================
-# 3. PROMPTS – GÉNÉRATION + JUGE (TEMPLATE TEXTE)
+# 3. PROMPTS – GENERATOR / JUDGE / SIMPLE AGENT
 # ============================================================
 
-GEN_SYS = """
-You generate forecasting questions in a STRICT, line-based text template.
+# ---------------------- Proto cluster generator ----------------------
 
-You are a deterministic template-filling engine. Formatting rules are CRITICAL:
-- Do NOT use markdown, bullets, JSON, or code fences.
-- Do NOT add any commentary before the first question or after the last one.
-- All fields must be on ONE line (no internal line breaks inside values).
-- You MUST respect the template exactly, with the same field labels and order.
-- You MUST output exactly N question blocks labelled QUESTION 1, QUESTION 2, ..., QUESTION N.
+GEN_SYS_PROTO = """
+You generate CLUSTERS of proto forecasting questions for Metaculus.
 
-All questions MUST be binary (YES/NO) with clearly defined conditions.
-The field "Answer-type" MUST ALWAYS be exactly: binary
+You are used inside an automated pipeline which will PARSE your output.
+If you deviate from the required format, your entire answer is discarded as unusable.
+
+ABSOLUTE RULES
+- You MUST strictly follow the template described below.
+- You MUST produce EXACTLY N questions: not fewer, not more.
+- You MUST NOT add explanations, apologies, headings, or commentary.
+- Your VERY FIRST non-empty line MUST be: "QUESTION 1".
+- Your LAST non-empty line MUST start with "Candidate-source:" for QUESTION N.
+- No markdown, no bullet points, no JSON, no code fences.
+
+CLUSTER BEHAVIOUR
+- Interpret the seed prompt as describing ONE central theme (the "cluster theme").
+- Produce a coherent cluster of N related proto-questions.
+- 1–2 questions should be broad "anchor" questions about the central theme (Role=CORE).
+- All remaining questions should be narrower "variants" exploring different angles of the same theme (Role=VARIANT).
+
+Content constraints:
+- Questions must be about an uncertain future or as-yet-unobserved outcome.
+- They must be potentially resolvable from public data (official statistics, major datasets, government reports, reputable newswires).
+- Avoid trivial questions whose probability is obviously ~0% or ~100%.
+- Avoid questions that are already resolved.
+
+FORMAT (STRICT, LINE-BASED)
+For each i = 1..N you output a block with these 5 lines:
+
+QUESTION i
+Role: CORE or VARIANT
+Title: <short title, <= 100 characters, single line>
+Question: <1–3 sentences, single line, ends with "?" or equivalent>
+Angle: <short phrase for the angle within the cluster>
+Candidate-source: <one likely family of public resolution sources or datasets, single line>
+
+No blank lines inside a block are required, but they are allowed between blocks.
+NEVER output any example or meta-commentary. Only the blocks above.
 """.strip()
 
-GEN_USER_TMPL = textwrap.dedent(
+GEN_USER_TMPL_PROTO = textwrap.dedent(
     """
-    Task: Generate {n} Metaculus-style forecasting questions (true questions with a "?" at the end).
+    You will now generate a CLUSTER of proto forecasting questions.
 
-    Topic brief (3–6 lines):
-    {brief}
+    HARD CONSTRAINT:
+    - N_questions = {n}.
+    - You MUST output EXACTLY N_questions blocks, labelled QUESTION 1, QUESTION 2, ..., QUESTION {n}.
+    - If you output fewer or more questions, or any text outside the template, the output is considered INVALID.
 
-    Domain tags: {tags}
-    Target horizon (if relevant): {horizon}
+    Seed prompt (1–12 sentences, central theme):
+    {seed}
 
-    For EACH question i = 1..{n}, you MUST output a block with EXACTLY this template:
+    Optional context:
+    - Domain tags: {tags}
+    - Horizon / rough timeline: {horizon}
 
-    QUESTION i
-    Title: <short title, <= 100 characters>
-    Body: <2–5 sentences, BUT all on a single line (no line breaks)>
-    Resolution: <exact steps to resolve (who/what/when/where), single line>
-    Timeframe-start: <YYYY-MM-DD HH:MM:SS UTC or empty if unknown>
-    Timeframe-end: <YYYY-MM-DD HH:MM:SS UTC (target resolution time), or empty>
-    Timezone: UTC
-    Answer-type: binary
+    Cluster constraints:
+    - 1–2 questions are broad anchor questions (Role=CORE), describing the main uncertainty about this theme.
+    - The remaining questions (Role=VARIANT) explore different angles: regions, actors, risk tails, adoption speed, distributional effects, policy scenarios, etc.
 
-    Constraints on content:
-    - All questions MUST be binary YES/NO, resolved by a clear condition in the Resolution field.
-    - Outcomes must be resolvable from public sources (official statistics, reputable newswires, etc.).
-    - Include explicit end dates (UTC) when possible and clear thresholds.
-    - Questions should be PLAUSIBLE: numeric thresholds, dates and quantities must be in realistic
-      ranges consistent with current public information and known orders of magnitude.
-      Avoid arbitrary or random-looking numbers (e.g. "17,345,678,901") when you have no basis.
-      If you are uncertain, prefer:
-        - ranges ("between 10% and 30%"),
-        - relative comparisons ("higher than in 2024"),
-        - or coarse thresholds (e.g. "above 3× the 2024 value"),
-      instead of a very specific figure that is likely to be wrong.
-    - Avoid questions already resolved at time of writing; there must be genuine uncertainty.
-
-    OUTPUT FORMAT (CRITICAL):
-    - You MUST output EXACTLY {n} question blocks, numbered QUESTION 1, QUESTION 2, ..., QUESTION {n}.
-    - Each block MUST follow the template above, in the same order and with the same labels.
-    - Separate blocks with a single blank line.
-    - Do NOT add any other lines, explanations, headings or comments.
+    Output ONLY the N blocks in the EXACT format specified in the system message.
+    Do NOT restate the instructions. Do NOT explain your choices.
     """
 )
 
-JUDGE_SYS = """
-You rate forecasting questions in a single semicolon-separated line.
+# ---------------------- Judge for proto ----------------------
 
-Rules (CRITICAL):
-- Output exactly ONE line of text.
-- Format must be:
-  clarity=X; operationalization=Y; plausibility=Z; usefulness=U; safety=S; overall=O; notes=TEXT
-- X,Y,Z,U,S are integers 1–5.
-- O is a float 1–5 (mean of the five scores, rounded to 2 decimals).
-- Do NOT use semicolons in notes; use commas instead.
-- No markdown, no extra lines, no JSON.
+JUDGE_SYS_PROTO = """
+You rate proto forecasting questions for Metaculus.
+
+Your output is consumed by an automated parser which expects a SINGLE LINE.
+If you output multiple lines or deviate from the format, the result is discarded.
+
+You MUST output exactly ONE line with this format:
+clarity=X; resolvability=Y; forecastability=Z; decision_relevance=U; cost_safety=V; verdict=ACCEPT|SOFT_REJECT|HARD_REJECT; rationale=TEXT
+
+Where:
+- X, Y, Z, U, V are integers from 1 (very bad) to 5 (excellent).
+- verdict is one of: ACCEPT, SOFT_REJECT, HARD_REJECT (uppercase).
+- TEXT is a short explanation (<= 250 characters) and MUST NOT contain semicolons.
+
+Criteria:
+- clarity: Is the question understandable and well-posed?
+- resolvability: Does it look resolvable from public sources in principle?
+- forecastability: Is the outcome non-trivial and not already determined?
+- decision_relevance: Would the outcome matter for at least some decisions?
+- cost_safety: Effort to operationalize/resolve and topic safety.
+
+Do NOT rewrite the question. Do NOT add extra lines. No markdown, no JSON.
 """.strip()
 
-JUDGE_USER_TMPL = textwrap.dedent(
+JUDGE_USER_TMPL_PROTO = textwrap.dedent(
     """
-    Rate the following forecasting question for Metaculus-style use on 5 dimensions:
-    - clarity (1–5),
-    - operationalization (1–5) – how well it can be mechanically resolved,
-    - plausibility (1–5) – are numbers/dates/scenarios realistic vs known orders of magnitude,
-    - usefulness (1–5) – decision/forecast value,
-    - safety (1–5) – policy/abuse issues.
+    Rate this proto forecasting question for Metaculus.
 
-    Then compute overall as the mean of the 5 scores, rounded to 2 decimals.
+    Cluster seed (theme):
+    {seed}
 
-    You MUST respond with EXACTLY ONE line:
-    clarity=X; operationalization=Y; plausibility=Z; usefulness=U; safety=S; overall=O; notes=TEXT
+    Proto-question:
+    Role: {role}
+    Angle: {angle}
+    Title: {title}
+    Question: {question}
+    Candidate-source: {source}
+
+    You are only scoring this proto-question, not rewriting it.
+
+    Return exactly one line:
+    clarity=X; resolvability=Y; forecastability=Z; decision_relevance=U; cost_safety=V; verdict=ACCEPT|SOFT_REJECT|HARD_REJECT; rationale=TEXT
+    """
+)
+
+# ---------------------- SIMPLE AGENT (verdict + p_auto_resolve + rationale) ----------------------
+
+AGENT_SYS_SIMPLE = """
+You are a resolution-focused publication agent for Metaculus proto-questions.
+
+You are used in a LOOP: the system calls you once per proto-question.
+EACH CALL is about ONE SINGLE proto-question. Other questions will be handled by other calls.
+
+Your job for this ONE proto-question:
+- Think briefly about how it could be resolved from public data (what sources, what measurable outcome).
+- Estimate P-auto-resolve: probability (0.0–1.0) that an automated system with web access could resolve it at the intended time.
+- Decide one of three publication verdicts:
+  - ACCEPT (publishable as-is or with minor editorial tweaks),
+  - SOFT_REJECT (interesting but has a fixable problem),
+  - HARD_REJECT (should not be published in this form).
+- Provide:
+  - a very short “resolution_hint” sentence (<= 200 characters) that names the main sources / metric for resolution,
+  - a very short “rationale” sentence (<= 250 characters) explaining the verdict.
+
+FORMAT (STRICT)
+Your output is parsed by a machine. You MUST output EXACTLY ONE LINE:
+
+p_auto_resolve=X; verdict=ACCEPT|SOFT_REJECT|HARD_REJECT; resolution_hint=TEXT; rationale=TEXT
+
+Where:
+- X is a float between 0.0 and 1.0 (you may write 0.65, 0.7, 0.3, etc.).
+- TEXT fields MUST NOT contain semicolons.
+- No markdown, no extra spaces at the beginning of the line, no commentary before or after.
+
+If you do anything else, your answer will be discarded by the pipeline.
+""".strip()
+
+AGENT_USER_TMPL_SIMPLE = textwrap.dedent(
+    """
+    You are evaluating a SINGLE proto forecasting question which has already passed a first quality screen.
+
+    Seed (cluster theme, for context only):
+    {seed}
+
+    Proto-question (the ONLY one you must evaluate in this call):
+    Role: {role}
+    Angle: {angle}
+    Title: {title}
+    Question: {question}
+    Candidate-source (family): {source_hint}
+
+    First-pass judge scores (for context only, not to restate):
+    clarity={clarity}, resolvability={resolvability}, forecastability={forecastability},
+    decision_relevance={decision_relevance}, cost_safety={cost_safety}, judge_verdict={judge_verdict}
+
+    Your output must be EXACTLY ONE LINE with this format:
+    p_auto_resolve=X; verdict=ACCEPT|SOFT_REJECT|HARD_REJECT; resolution_hint=TEXT; rationale=TEXT
 
     Where:
-    - X,Y,Z,U,S are integers 1–5,
-    - O is a float 1–5,
-    - TEXT is a short justification (<= 300 characters),
-    - Do NOT use semicolons in TEXT.
+    - X is in [0.0, 1.0].
+    - resolution_hint is one concise sentence mentioning the main public sources and type of measurable outcome.
+    - rationale is one concise sentence explaining why you chose this verdict.
+    - Neither TEXT may contain semicolons.
 
-    Question:
-    Title: {title}
-    Body: {body}
-    Resolution: {resolution}
-    Timeframe-start: {tstart}
-    Timeframe-end: {tend}
-    Timezone: {tz}
-    Answer-type: {atype}
+    Do NOT mention other questions or the rest of the cluster.
+    Do NOT add any lines before or after this one line.
     """
 )
 
 
 # ============================================================
-# 4. PARSING – QUESTIONS & SCORES
+# 4. PARSING HELPERS
 # ============================================================
 
-def mock_questions(brief: str, n: int) -> List[Dict[str, Any]]:
-    """Mode démo sans API : fabrique des questions factices."""
-    out: List[Dict[str, Any]] = []
-    prefix = brief.strip().split("\n")[0][:60] or "Example topic"
-    for i in range(n):
-        out.append(
-            {
-                "title": f"[MOCK] {prefix} – Q{i+1}",
-                "body": "This is a mock binary question body for testing the UI, ending with a question?",
-                "resolution": (
-                    "On 2030-12-31 23:59:59 UTC, check source X; "
-                    "resolve YES if condition Y holds, otherwise NO."
-                ),
-                "timeframe_start": "2025-01-01 00:00:00",
-                "timeframe_end": "2030-12-31 23:59:59",
-                "timezone": "UTC",
-                "answer_type": "binary",
-            }
-        )
-    return out
-
-
-def parse_questions_from_text(text: str) -> List[Dict[str, Any]]:
+def parse_proto_questions_from_text(text: str) -> List[Dict[str, Any]]:
     """
-    Parse la sortie du générateur au format :
-
-    QUESTION i
-    Title: ...
-    Body: ...
-    Resolution: ...
-    Timeframe-start: ...
-    Timeframe-end: ...
-    Timezone: ...
-    Answer-type: ...
+    Parse QUESTION i / Role / Title / Question / Angle / Candidate-source blocks.
     """
-    lines = [ln.rstrip() for ln in text.splitlines()]
+    lines = [ln.rstrip("\n") for ln in text.splitlines()]
     questions: List[Dict[str, Any]] = []
-
     current: Optional[Dict[str, Any]] = None
 
     def push_current():
         nonlocal current
-        if current and (current.get("title") or current.get("body")):
+        if not current:
+            return
+        if current.get("title") and current.get("question"):
+            current.setdefault("role", "VARIANT")
+            current.setdefault("angle", "")
+            current.setdefault("candidate_source", "")
             questions.append(current)
         current = None
 
@@ -285,138 +332,176 @@ def parse_questions_from_text(text: str) -> List[Dict[str, Any]]:
         line = raw.strip()
         if not line:
             continue
-
-        m_q = re.match(r"^QUESTION\s+(\d+)", line, flags=re.IGNORECASE)
-        if m_q:
-            # Nouvelle question
+        if line.upper().startswith("QUESTION "):
             push_current()
             current = {
+                "role": "VARIANT",
+                "angle": "",
                 "title": "",
-                "body": "",
-                "resolution": "",
-                "timeframe_start": "",
-                "timeframe_end": "",
-                "timezone": "",
-                "answer_type": "",
+                "question": "",
+                "candidate_source": "",
             }
             continue
-
         if current is None:
-            # Ignore tout texte avant la première "QUESTION"
             continue
+        lower = line.lower()
+        if lower.startswith("role:"):
+            val = line.split(":", 1)[1].strip().upper()
+            if val not in {"CORE", "VARIANT"}:
+                val = "VARIANT"
+            current["role"] = val
+        elif lower.startswith("title:"):
+            current["title"] = line.split(":", 1)[1].strip()
+        elif lower.startswith("question:"):
+            current["question"] = line.split(":", 1)[1].strip()
+        elif lower.startswith("angle:"):
+            current["angle"] = line.split(":", 1)[1].strip()
+        elif lower.startswith("candidate-source:"):
+            current["candidate_source"] = line.split(":", 1)[1].strip()
 
-        # Parsing champ: "Key: value"
-        if ":" not in line:
-            continue
-        key, val = line.split(":", 1)
-        key = key.strip().lower()
-        val = val.strip()
-
-        if key == "title":
-            current["title"] = val
-        elif key == "body":
-            current["body"] = val
-        elif key == "resolution":
-            current["resolution"] = val
-        elif key == "timeframe-start":
-            current["timeframe_start"] = val
-        elif key == "timeframe-end":
-            current["timeframe_end"] = val
-        elif key == "timezone":
-            current["timezone"] = val
-        elif key == "answer-type":
-            current["answer_type"] = val
-
-    # Dernière question
     push_current()
     return questions
 
 
-def parse_judge_line(line: str) -> Dict[str, Any]:
-    """
-    Parse une ligne du type :
-    clarity=X; operationalization=Y; plausibility=Z; usefulness=U; safety=S; overall=O; notes=TEXT
-    """
+def parse_judge_line_proto(line: str) -> Dict[str, Any]:
     line = line.strip()
-    parts = [p.strip() for p in line.split(";")]
-    if len(parts) < 6:
-        raise ValueError(f"Judge line too short: {line!r}")
+    parts = [p.strip() for p in line.split(";") if p.strip()]
+    mapping: Dict[str, str] = {}
+    for seg in parts:
+        if "=" not in seg:
+            continue
+        k, v = seg.split("=", 1)
+        mapping[k.strip().lower()] = v.strip()
 
-    mapping: Dict[str, Any] = {}
-
-    def parse_val(segment: str) -> (str, str):
-        if "=" not in segment:
-            return segment.strip().lower(), ""
-        k, v = segment.split("=", 1)
-        return k.strip().lower(), v.strip()
-
-    keys_expected = [
-        "clarity",
-        "operationalization",
-        "plausibility",
-        "usefulness",
-        "safety",
-        "overall",
-    ]
-
-    for i, key_name in enumerate(keys_expected):
-        if i >= len(parts):
-            break
-        k, v = parse_val(parts[i])
-        if k != key_name:
-            k = key_name
-        mapping[k] = v
-
-    if len(parts) > len(keys_expected):
-        notes_raw = ";".join(parts[len(keys_expected):]).strip()
-        if notes_raw.lower().startswith("notes="):
-            notes_raw = notes_raw[6:].strip()
-        mapping["notes"] = notes_raw
-    else:
-        mapping["notes"] = ""
-
-    def to_int(name: str, default: int = 3) -> int:
+    def to_int(name: str, default: int = 0) -> int:
         try:
-            return int(round(float(mapping.get(name, default))))
-        except Exception:
-            return default
-
-    def to_float(name: str, default: float = 0.0) -> float:
-        try:
-            return float(mapping.get(name, default))
+            return int(mapping.get(name, default))
         except Exception:
             return default
 
     clarity = to_int("clarity")
-    operationalization = to_int("operationalization")
-    plausibility = to_int("plausibility")
-    usefulness = to_int("usefulness")
-    safety = to_int("safety", default=5)
-    overall = to_float("overall", default=0.0)
+    resolvability = to_int("resolvability")
+    forecastability = to_int("forecastability")
+    decision_relevance = to_int("decision_relevance")
+    cost_safety = to_int("cost_safety")
 
-    if overall <= 0:
-        overall = round(
-            (clarity + operationalization + plausibility + usefulness + safety) / 5.0,
-            2,
-        )
+    verdict = mapping.get("verdict", "SOFT_REJECT").strip().upper()
+    if verdict not in {"ACCEPT", "SOFT_REJECT", "HARD_REJECT"}:
+        verdict = "SOFT_REJECT"
+
+    rationale = mapping.get("rationale", "").replace(";", ",")
+
+    scores = [
+        clarity,
+        resolvability,
+        forecastability,
+        decision_relevance,
+        cost_safety,
+    ]
+    valid_scores = [s for s in scores if isinstance(s, (int, float)) and s > 0]
+    if valid_scores:
+        overall = round(sum(valid_scores) / len(valid_scores), 2)
+    else:
+        overall = 0.0
 
     return {
         "clarity": clarity,
-        "operationalization": operationalization,
-        "plausibility": plausibility,
-        "usefulness": usefulness,
-        "safety": safety,
-        "overall": round(overall, 2),
-        "notes": mapping.get("notes", ""),
+        "resolvability": resolvability,
+        "forecastability": forecastability,
+        "decision_relevance": decision_relevance,
+        "cost_safety": cost_safety,
+        "verdict": verdict,
+        "rationale": rationale,
+        "overall": overall,
     }
 
 
+def _extract_first_float(value: str, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    value = value.strip()
+    try:
+        return float(value)
+    except Exception:
+        pass
+    m = re.search(r"[-+]?\d*\.?\d+", value)
+    if not m:
+        return default
+    try:
+        return float(m.group(0))
+    except Exception:
+        return default
+
+
+def parse_agent_line_simple(line: str) -> Dict[str, Any]:
+    """
+    Parse agent simple line:
+    p_auto_resolve=X; verdict=...; resolution_hint=TEXT; rationale=TEXT
+    """
+    line = line.strip()
+    parts = [p.strip() for p in line.split(";") if p.strip()]
+    mapping: Dict[str, str] = {}
+    for seg in parts:
+        if "=" not in seg:
+            continue
+        k, v = seg.split("=", 1)
+        mapping[k.strip().lower()] = v.strip()
+
+    p_val = _extract_first_float(mapping.get("p_auto_resolve", "0.0"), default=0.0)
+
+    verdict = mapping.get("verdict", "").strip().upper()
+    if verdict not in {"ACCEPT", "SOFT_REJECT", "HARD_REJECT"}:
+        verdict = "SOFT_REJECT"
+
+    resolution_hint = mapping.get("resolution_hint", "")
+    rationale = mapping.get("rationale", "")
+
+    return {
+        "p_auto_resolve": p_val,
+        "agent_verdict": verdict,
+        "resolution_hint": resolution_hint.replace(";", ","),
+        "agent_rationale": rationale.replace(";", ","),
+    }
+
+
+def compute_overall_score(
+    clarity: int,
+    resolvability: int,
+    forecastability: int,
+    decision_relevance: int,
+    cost_safety: int,
+) -> float:
+    scores = [clarity, resolvability, forecastability, decision_relevance, cost_safety]
+    valid = [s for s in scores if isinstance(s, (int, float)) and s > 0]
+    if not valid:
+        return 0.0
+    return round(sum(valid) / len(valid), 2)
+
+
 # ============================================================
-# 5. PIPELINE – GÉNÉRATION & JUGE
+# 5. PIPELINE – GENERATION / JUDGE / SIMPLE AGENT
 # ============================================================
 
-def generate_questions(
-    brief: str,
+def mock_proto_questions(seed: str, n: int) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    prefix = seed.strip().split("\n")[0][:60] or "Example topic"
+    for i in range(n):
+        role = "CORE" if i == 0 else "VARIANT"
+        angle = "anchor question" if i == 0 else f"variant angle #{i}"
+        out.append(
+            {
+                "role": role,
+                "angle": angle,
+                "title": f"[MOCK] {prefix} – Q{i+1}",
+                "question": "Will the mocked event occur by 2030?",
+                "candidate_source": "Mock dataset / World Bank / Reuters",
+            }
+        )
+    return out
+
+
+def generate_proto_questions(
+    seed: str,
     tags: List[str],
     horizon: str,
     n: int,
@@ -424,18 +509,13 @@ def generate_questions(
     dry_run: bool = False,
     max_attempts: int = 3,
 ) -> Dict[str, Any]:
-    """
-    Génère des questions au format texte structuré, puis parse en liste de dicts.
-    Utilise plusieurs tentatives si le modèle ne renvoie pas assez de questions.
-    """
     if dry_run:
-        qs = mock_questions(brief, n)
+        questions = mock_proto_questions(seed, n)
         return {
-            "model": "[MOCK]",
-            "questions": qs,
-            "raw_output": "(mock)",
+            "questions": questions,
+            "raw_output": "",
+            "n_parsed": len(questions),
             "n_requested": n,
-            "n_parsed": len(qs),
             "attempts": 1,
         }
 
@@ -445,113 +525,217 @@ def generate_questions(
 
     while len(all_questions) < n and attempts < max_attempts:
         attempts += 1
-        remaining = n - len(all_questions)
-
-        user = GEN_USER_TMPL.format(
-            n=remaining,
-            brief=brief,
-            tags=",".join(tags),
-            horizon=horizon,
+        need = n - len(all_questions)
+        user_prompt = GEN_USER_TMPL_PROTO.format(
+            n=need,
+            seed=seed.strip(),
+            tags=", ".join(tags) or "unspecified",
+            horizon=horizon.strip() or "unspecified",
         )
 
         raw = call_openrouter_raw(
             messages=[
-                {"role": "system", "content": GEN_SYS},
-                {"role": "user", "content": user},
+                {"role": "system", "content": GEN_SYS_PROTO},
+                {"role": "user", "content": user_prompt},
             ],
             model=model,
-            max_tokens=4000,
-            temperature=0.0,  # on privilégie l'obéissance au template
+            max_tokens=3500,
+            temperature=0.5,
         )
         raw_chunks.append(raw)
 
-        new_questions = parse_questions_from_text(raw)
-        if not new_questions:
-            continue
-
-        all_questions.extend(new_questions)
+        new_questions = parse_proto_questions_from_text(raw)
+        if new_questions:
+            all_questions.extend(new_questions)
 
     if not all_questions:
-        raise RuntimeError("Could not parse any questions from model outputs.")
+        raise RuntimeError("Generator returned no parsable proto-questions.")
 
-    if len(all_questions) > n:
-        all_questions = all_questions[:n]
+    questions = all_questions[:n]
+    raw_output = "\n\n-----\n\n".join(raw_chunks)
 
     return {
-        "model": model,
-        "questions": all_questions,
-        "raw_output": "\n\n----- ATTEMPT SEPARATOR -----\n\n".join(raw_chunks),
+        "questions": questions,
+        "raw_output": raw_output,
+        "n_parsed": len(questions),
         "n_requested": n,
-        "n_parsed": len(all_questions),
         "attempts": attempts,
     }
 
 
-def judge_question(
-    question: Dict[str, Any],
+def judge_proto_question(
+    q: Dict[str, Any],
+    seed: str,
     model: str,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """
-    Retourne un dict avec les clés :
-      "clarity", "operationalization", "plausibility",
-      "usefulness", "safety", "overall", "notes".
-    """
     if dry_run:
-        import random
-
         clarity = random.randint(3, 5)
-        oper = random.randint(3, 5)
-        plaus = random.randint(3, 5)
-        use = random.randint(3, 5)
-        safety = 5
-        overall = round((clarity + oper + plaus + use + safety) / 5.0, 2)
+        resolvability = random.randint(2, 5)
+        forecastability = random.randint(2, 5)
+        decision_relevance = random.randint(2, 5)
+        cost_safety = random.randint(2, 5)
+        overall = compute_overall_score(
+            clarity, resolvability, forecastability, decision_relevance, cost_safety
+        )
+        verdict = random.choice(["ACCEPT", "SOFT_REJECT", "HARD_REJECT"])
+        rationale = "Mock scores for dry-run."
         return {
             "clarity": clarity,
-            "operationalization": oper,
-            "plausibility": plaus,
-            "usefulness": use,
-            "safety": safety,
+            "resolvability": resolvability,
+            "forecastability": forecastability,
+            "decision_relevance": decision_relevance,
+            "cost_safety": cost_safety,
+            "verdict": verdict,
+            "rationale": rationale,
             "overall": overall,
-            "notes": "Mock scores for dry-run mode.",
         }
 
-    user = JUDGE_USER_TMPL.format(
-        title=question.get("title", ""),
-        body=question.get("body", ""),
-        resolution=question.get("resolution", ""),
-        tstart=question.get("timeframe_start", ""),
-        tend=question.get("timeframe_end", ""),
-        tz=question.get("timezone", ""),
-        atype=question.get("answer_type", ""),
+    user_text = JUDGE_USER_TMPL_PROTO.format(
+        seed=seed.strip(),
+        role=q.get("role", "VARIANT"),
+        angle=q.get("angle", ""),
+        title=q.get("title", ""),
+        question=q.get("question", ""),
+        source=q.get("candidate_source", ""),
     )
-
     raw = call_openrouter_raw(
         messages=[
-            {"role": "system", "content": JUDGE_SYS},
-            {"role": "user", "content": user},
+            {"role": "system", "content": JUDGE_SYS_PROTO},
+            {"role": "user", "content": user_text},
         ],
         model=model,
-        max_tokens=400,
+        max_tokens=512,
         temperature=0.0,
     )
+    first_line = ""
+    for ln in raw.splitlines():
+        if ln.strip():
+            first_line = ln.strip()
+            break
+    if not first_line:
+        raise RuntimeError(f"Empty judge response: {raw!r}")
 
-    try:
-        return parse_judge_line(raw)
-    except Exception as e:
-        raise RuntimeError(f"Failed to parse judge output: {e}. Raw: {raw!r}") from e
+    return parse_judge_line_proto(first_line)
 
 
-def judge_all_questions(
+def judge_all_proto(
     questions: List[Dict[str, Any]],
+    seed: str,
     model: str,
     dry_run: bool = False,
 ) -> List[Dict[str, Any]]:
     scores: List[Dict[str, Any]] = []
     for q in questions:
-        s = judge_question(q, model=model, dry_run=dry_run)
+        s = judge_proto_question(q, seed=seed, model=model, dry_run=dry_run)
         scores.append(s)
     return scores
+
+
+def agent_eval_for_question_simple(
+    q: Dict[str, Any],
+    judge: Dict[str, Any],
+    seed: str,
+    model: str,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    if dry_run:
+        p = round(random.uniform(0.2, 0.9), 2)
+        verdict = random.choice(["ACCEPT", "SOFT_REJECT", "HARD_REJECT"])
+        return {
+            "p_auto_resolve": p,
+            "agent_verdict": verdict,
+            "resolution_hint": "Mock resolution via generic public data.",
+            "agent_rationale": "Mock agent rationale (dry-run).",
+        }
+
+    user_text = AGENT_USER_TMPL_SIMPLE.format(
+        seed=seed.strip(),
+        role=q.get("role", "VARIANT"),
+        angle=q.get("angle", ""),
+        title=q.get("title", ""),
+        question=q.get("question", ""),
+        source_hint=q.get("candidate_source", ""),
+        clarity=judge.get("clarity", 0),
+        resolvability=judge.get("resolvability", 0),
+        forecastability=judge.get("forecastability", 0),
+        decision_relevance=judge.get("decision_relevance", 0),
+        cost_safety=judge.get("cost_safety", 0),
+        judge_verdict=judge.get("verdict", ""),
+    )
+
+    raw = call_openrouter_raw(
+        messages=[
+            {"role": "system", "content": AGENT_SYS_SIMPLE},
+            {"role": "user", "content": user_text},
+        ],
+        model=model,
+        max_tokens=600,
+        temperature=0.1,
+    )
+
+    first_line = ""
+    for ln in raw.splitlines():
+        if ln.strip():
+            first_line = ln.strip()
+            break
+    if not first_line:
+        return {
+            "p_auto_resolve": 0.0,
+            "agent_verdict": "SOFT_REJECT",
+            "resolution_hint": "",
+            "agent_rationale": "Empty agent response.",
+        }
+
+    return parse_agent_line_simple(first_line)
+
+
+def agent_eval_top_k(
+    questions: List[Dict[str, Any]],
+    judge_scores: List[Dict[str, Any]],
+    seed: str,
+    model: str,
+    dry_run: bool,
+    top_k: int,
+) -> List[Optional[Dict[str, Any]]]:
+    """
+    Judge ranks all questions and selects the K best.
+    The agent processes ALL selected questions (K of them), one call per question.
+    Questions outside the top-K are marked as DROPPED_BY_JUDGE.
+    """
+    n = len(questions)
+    if n == 0:
+        return []
+
+    overall_list: List[float] = []
+    for s in judge_scores:
+        o = s.get("overall", 0.0)
+        if not o or o <= 0:
+            o = compute_overall_score(
+                s.get("clarity", 0),
+                s.get("resolvability", 0),
+                s.get("forecastability", 0),
+                s.get("decision_relevance", 0),
+                s.get("cost_safety", 0),
+            )
+        overall_list.append(o)
+
+    idx_sorted = sorted(range(n), key=lambda i: overall_list[i], reverse=True)
+    agent_results: List[Optional[Dict[str, Any]]] = [None] * n
+
+    k_eff = min(max(top_k, 0), n)
+    for rank, idx in enumerate(idx_sorted):
+        if rank >= k_eff:
+            break
+        agent_results[idx] = agent_eval_for_question_simple(
+            questions[idx],
+            judge_scores[idx],
+            seed=seed,
+            model=model,
+            dry_run=dry_run,
+        )
+
+    return agent_results
 
 
 # ============================================================
@@ -559,24 +743,39 @@ def judge_all_questions(
 # ============================================================
 
 st.set_page_config(
-    page_title="Metaculus – Question Generator + Judge",
+    page_title="Metaculus – Proto Question Cluster + Judge + Simple Agent",
     page_icon="📊",
     layout="wide",
 )
 
-st.title("Metaculus – Question Generator + Judge (Text Template)")
+st.title("Metaculus – Proto Question Cluster + Judge + Simple Agent")
 
 st.markdown(
     """
 Pipeline:
-1. Generate N Metaculus-style questions with a strict line-based template (no JSON).
-2. Score each question on clarity, operationalization, PLAUSIBILITY, usefulness, safety.
-3. Keep the top K questions by overall score.
+
+1. Generate **X proto-questions** from a seed prompt, as a coherent cluster around one theme.
+2. A **judge** scores each question on 5 criteria and ranks them.
+3. The **K best questions** (by judge overall score) are sent to a **simple agent** that:
+   - estimates **P-auto-resolve** (0–1),
+   - outputs a short **resolution_hint** (how it would be resolved),
+   - assigns a final verdict: `ACCEPT`, `SOFT_REJECT`, or `HARD_REJECT`,
+   - gives a brief rationale for that verdict.
+
+The agent’s output is a single, semicolon-separated line to keep parsing robust.
+JSON only appears at download time.
 """
 )
 
+# ---------------------- Sidebar ----------------------
+
 with st.sidebar:
-    st.header("Settings")
+    st.header("OpenRouter configuration")
+
+    dry_run = st.checkbox(
+        "Dry run (no API calls, mock questions & scores)",
+        value=False,
+    )
 
     api_key_input = st.text_input(
         "OpenRouter API key",
@@ -589,79 +788,81 @@ with st.sidebar:
     model_override = st.text_input(
         "OpenRouter model ID",
         value=OPENROUTER_MODEL_ENV or DEFAULT_MODEL,
-        help=(
-            "Examples: openai/gpt-4o-mini, openai/gpt-5.1, "
-            "anthropic/claude-3.5-sonnet, qwen/qwen-2.5-32b-instruct..."
-        ),
+        help="Example: openai/gpt-4o-mini, openai/gpt-5.1, anthropic/claude-3.5-sonnet, ...",
     )
 
     n = st.slider(
-        "Number of questions to generate (N)",
+        "Number X of proto-questions to generate",
         min_value=1,
-        max_value=20,
-        value=8,
+        max_value=30,
+        value=10,
         step=1,
     )
 
     top_k = st.slider(
-        "Top K questions to keep",
+        "K best questions for agent (X ≥ K)",
         min_value=1,
-        max_value=20,
+        max_value=30,
         value=5,
         step=1,
-    )
-
-    dry_run = st.checkbox(
-        "Dry run (no API calls, mock questions & scores)",
-        value=False,
     )
 
 current_key = get_openrouter_key()
 if not current_key and not dry_run:
     st.warning(
         "No OPENROUTER_API_KEY detected. Enter it in the sidebar, "
-        "or set it as an environment variable / Streamlit secret."
+        "or enable dry_run mode for local testing."
     )
 
-st.subheader("Problem setup")
+# ---------------------- Main inputs ----------------------
 
-brief = st.text_area(
-    "Topic brief (3–6 lines)",
-    height=150,
-    placeholder="Describe the domain, actors, uncertainty and plausible ranges you care about...",
+st.subheader("Seed prompt")
+
+seed = st.text_area(
+    "Seed prompt (1–12 sentences)",
+    height=180,
+    placeholder=(
+        "Describe the central theme and uncertainty.\n"
+        "Example: 'I want questions about the adoption of LLMs in universities worldwide, "
+        "including distributional impacts, policy responses, and long-run productivity effects up to 2035.'"
+    ),
 )
 
 tags_str = st.text_input(
     "Domain tags (comma-separated)",
-    value="ai,policy,geopolitics",
+    value="ai,policy,education",
 )
 
 horizon = st.text_input(
-    "Horizon / resolution description",
+    "Horizon / rough timeline",
     value="resolve by 2035-12-31 UTC",
 )
 
-run_button = st.button("Generate + Judge questions")
+run_button = st.button("Run full pipeline (X → judge → K → agent)")
 
-# ------------------------------------------------------------
-# 7. RUN PIPELINE ON BUTTON CLICK
-# ------------------------------------------------------------
+
+# ---------------------- Run pipeline ----------------------
 
 if run_button:
-    if not brief.strip():
-        st.warning("Please provide at least a short topic brief.")
+    if not seed.strip():
+        st.warning("Please provide a seed prompt.")
     elif not dry_run and not current_key:
         st.error("No OPENROUTER_API_KEY set and dry_run is disabled.")
     else:
         tags = [t.strip() for t in tags_str.split(",") if t.strip()]
         model = (model_override or "").strip() or DEFAULT_MODEL
 
+        if top_k > n:
+            st.warning("K cannot be larger than X; K has been truncated to X.")
+            top_k = n
+
         st.info(f"Using model: `{model}`")
 
-        with st.spinner("Generating questions..."):
+        # 1) Generation
+        with st.spinner("Generating proto-question cluster..."):
             try:
-                gen_res = generate_questions(
-                    brief=brief,
+                gen_res = generate_proto_questions(
+                    seed=seed,
                     tags=tags,
                     horizon=horizon,
                     n=n,
@@ -677,127 +878,294 @@ if run_button:
             n_parsed = gen_res.get("n_parsed", len(questions))
             n_requested = gen_res.get("n_requested", n)
             attempts = gen_res.get("attempts", 1)
+            raw_output = gen_res.get("raw_output", "")
 
             if n_parsed < n_requested:
                 st.warning(
-                    f"Generator returned only {n_parsed} questions out of requested {n_requested} "
-                    f"after {attempts} attempt(s). Top-K will be at most {n_parsed}."
+                    f"Generator returned only {n_parsed} proto-questions out of requested {n_requested} "
+                    f"after {attempts} attempt(s)."
                 )
 
-            with st.spinner("Judging questions..."):
-                try:
-                    scores_list = judge_all_questions(
-                        questions=questions,
-                        model=model,
-                        dry_run=dry_run,
-                    )
-                except Exception as e:
-                    st.error(f"Judge error: {e}")
-                    scores_list = None
-
-            if scores_list is not None:
-                # Combine questions + scores, puis tri par overall
-                entries = []
-                for q, s in zip(questions, scores_list):
-                    entries.append({"question": q, "scores": s})
-
-                entries_sorted = sorted(
-                    entries,
-                    key=lambda e: e["scores"]["overall"],
-                    reverse=True,
-                )
-                effective_k = min(len(entries_sorted), top_k)
-                entries_sorted = entries_sorted[:effective_k]
-
-                res = {
-                    "model": model,
-                    "entries": entries_sorted,
-                    "raw_output": gen_res["raw_output"],
-                    "n_parsed": n_parsed,
-                    "n_requested": n_requested,
-                    "top_k_requested": top_k,
-                    "top_k_effective": effective_k,
-                    "attempts": attempts,
-                }
+            if not questions:
+                st.error("No proto-questions were parsed. Check generator prompts.")
             else:
-                res = None
-        else:
-            res = None
+                # 2) Judge
+                with st.spinner("Judging proto-questions (first pass)..."):
+                    try:
+                        scores_list = judge_all_proto(
+                            questions=questions,
+                            seed=seed,
+                            model=model,
+                            dry_run=dry_run,
+                        )
+                    except Exception as e:
+                        st.error(f"Judge error: {e}")
+                        scores_list = None
 
-        st.session_state["qgen_result"] = res
+                if scores_list is not None:
+                    # 3) Agent on top-K
+                    with st.spinner("Agent evaluating K best questions (P-auto-resolve + verdict)..."):
+                        try:
+                            agent_list = agent_eval_top_k(
+                                questions=questions,
+                                judge_scores=scores_list,
+                                seed=seed,
+                                model=model,
+                                dry_run=dry_run,
+                                top_k=top_k,
+                            )
+                        except Exception as e:
+                            st.error(f"Agent error: {e}")
+                            agent_list = [None] * len(questions)
 
-# ------------------------------------------------------------
-# 8. DISPLAY LAST RESULT (PERSISTENT)
-# ------------------------------------------------------------
+                    # 4) Combine
+                    entries: List[Dict[str, Any]] = []
+
+                    overall_list = [
+                        s.get("overall")
+                        if s.get("overall")
+                        else compute_overall_score(
+                            s.get("clarity", 0),
+                            s.get("resolvability", 0),
+                            s.get("forecastability", 0),
+                            s.get("decision_relevance", 0),
+                            s.get("cost_safety", 0),
+                        )
+                        for s in scores_list
+                    ]
+                    idx_sorted = sorted(
+                        range(len(questions)),
+                        key=lambda i: overall_list[i],
+                        reverse=True,
+                    )
+                    judge_rank_map = {idx: rank + 1 for rank, idx in enumerate(idx_sorted)}
+
+                    for idx, q in enumerate(questions):
+                        j = scores_list[idx]
+                        a = agent_list[idx]
+
+                        overall = j.get("overall")
+                        if not overall or overall <= 0:
+                            overall = compute_overall_score(
+                                j.get("clarity", 0),
+                                j.get("resolvability", 0),
+                                j.get("forecastability", 0),
+                                j.get("decision_relevance", 0),
+                                j.get("cost_safety", 0),
+                            )
+
+                        if a is None:
+                            final_verdict = "DROPPED_BY_JUDGE"
+                            p_auto = 0.0
+                        else:
+                            final_verdict = a.get("agent_verdict", "SOFT_REJECT")
+                            p_auto = a.get("p_auto_resolve", 0.0)
+
+                        entries.append(
+                            {
+                                "question": q,
+                                "judge": {
+                                    **j,
+                                    "overall": overall,
+                                    "judge_rank": judge_rank_map[idx],
+                                },
+                                "agent": a,
+                                "final": {
+                                    "final_verdict": final_verdict,
+                                    "p_auto_resolve": p_auto,
+                                },
+                            }
+                        )
+
+                    def severity_order(v: str) -> int:
+                        v = (v or "").upper()
+                        if v == "ACCEPT":
+                            return 0
+                        if v == "SOFT_REJECT":
+                            return 1
+                        if v == "HARD_REJECT":
+                            return 2
+                        if v == "DROPPED_BY_JUDGE":
+                            return 3
+                        return 2
+
+                    entries_sorted = sorted(
+                        entries,
+                        key=lambda e: (
+                            severity_order(e["final"]["final_verdict"]),
+                            -e["judge"]["overall"],
+                            -(e["final"]["p_auto_resolve"] or 0.0),
+                        ),
+                    )
+
+                    res = {
+                        "model": model,
+                        "seed": seed,
+                        "tags": tags,
+                        "horizon": horizon,
+                        "n_requested": n_requested,
+                        "n_parsed": n_parsed,
+                        "top_k": min(top_k, len(questions)),
+                        "entries": entries_sorted,
+                        "raw_output": raw_output,
+                    }
+                else:
+                    res = None
+
+                st.session_state["qgen_result"] = res
+
+# ---------------------- Display results ----------------------
 
 res = st.session_state.get("qgen_result")
 
 if res is not None:
     model = res["model"]
+    seed = res["seed"]
+    tags = res["tags"]
+    horizon = res["horizon"]
     entries = res["entries"]
-    raw_output = res["raw_output"]
-    n_parsed = res.get("n_parsed")
-    n_requested = res.get("n_requested")
-    top_k_requested = res.get("top_k_requested")
-    top_k_effective = res.get("top_k_effective")
-    attempts = res.get("attempts", 1)
+    raw_output = res.get("raw_output", "")
 
-    st.subheader("Model used")
-    st.write(model)
+    st.subheader("Last run summary")
 
-    # Tableau structuré pour affichage / export
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.markdown(f"**Model:** `{model}`")
+        st.markdown(
+            f"**X generated (parsed):** {res['n_parsed']} "
+            f"(requested {res['n_requested']})"
+        )
+    with col_b:
+        st.markdown(f"**K sent to agent (top by judge):** {res['top_k']}")
+        st.markdown(f"**Tags:** {', '.join(tags) if tags else '(none)'}")
+    with col_c:
+        st.markdown(f"**Horizon:** {horizon}")
+        st.markdown("**Seed preview:**")
+        st.caption(seed[:200] + ("..." if len(seed) > 200 else ""))
+
+    st.info(
+        "P-auto-resolve is the agent’s estimate (0–1) of the probability that an automated "
+        "resolver could settle the question from public sources using the hinted resolution path."
+    )
+
+    # Flatten entries
     rows = []
-    for e in entries:
+    for idx, e in enumerate(entries, start=1):
         q = e["question"]
-        s = e["scores"]
+        j = e["judge"]
+        a = e["agent"] or {}
+        f = e["final"]
+
         rows.append(
             {
-                "overall": s.get("overall", 0.0),
-                "clarity": s.get("clarity"),
-                "operationalization": s.get("operationalization"),
-                "plausibility": s.get("plausibility"),
-                "usefulness": s.get("usefulness"),
-                "safety": s.get("safety"),
+                "rank_overall": idx,
+                "judge_rank": j.get("judge_rank", None),
+                "final_verdict": f.get("final_verdict", ""),
+                "p_auto_resolve": f.get("p_auto_resolve", 0.0),
+                "overall_judge": j.get("overall", 0.0),
+                "role": q.get("role", ""),
+                "angle": q.get("angle", ""),
                 "title": q.get("title", ""),
-                "body": q.get("body", ""),
-                "resolution": q.get("resolution", ""),
-                "timeframe_start": q.get("timeframe_start", ""),
-                "timeframe_end": q.get("timeframe_end", ""),
-                "timezone": q.get("timezone", ""),
-                "answer_type": q.get("answer_type", ""),
-                "judge_notes": s.get("notes", ""),
+                "question": q.get("question", ""),
+                "candidate_source": q.get("candidate_source", ""),
+                "clarity": j.get("clarity"),
+                "resolvability": j.get("resolvability"),
+                "forecastability": j.get("forecastability"),
+                "decision_relevance": j.get("decision_relevance"),
+                "cost_safety": j.get("cost_safety"),
+                "judge_verdict": j.get("verdict", ""),
+                "judge_rationale": j.get("rationale", ""),
+                "agent_verdict": a.get("agent_verdict", ""),
+                "agent_resolution_hint": a.get("resolution_hint", ""),
+                "agent_rationale": a.get("agent_rationale", ""),
             }
         )
 
     df = pd.DataFrame(rows)
-    df = df.sort_values("overall", ascending=False)
 
-    st.subheader("Top-K judged questions")
-    st.caption(
-        f"Parsed {n_parsed} / requested {n_requested} questions "
-        f"after {attempts} attempt(s). "
-        f"Top-K requested = {top_k_requested}, showing {top_k_effective}."
-    )
-    st.dataframe(df, use_container_width=True, height=500)
+    st.subheader("Evaluated proto-question cluster")
 
-    top = df.iloc[0]
-    st.markdown("### Best question (rank #1)")
-    st.markdown(f"**Title:** {top['title']}")
-    st.markdown(f"**Body:** {top['body']}")
-    st.markdown(f"**Resolution:** {top['resolution']}")
-    st.markdown(
-        f"**Timeframe:** {top['timeframe_start']} → "
-        f"{top['timeframe_end']} ({top['timezone'] or 'UTC'})"
+    filter_choice = st.selectbox(
+        "Which questions to show?",
+        [
+            "Agent ACCEPT only",
+            "Agent ACCEPT + SOFT_REJECT",
+            "All questions (including HARD_REJECT and dropped)",
+        ],
+        index=0,
     )
-    st.markdown(f"**Answer type:** {top['answer_type']}")
-    st.markdown(
-        f"**Scores:** overall={top['overall']} "
-        f"(clarity={top['clarity']}, operationalization={top['operationalization']}, "
-        f"plausibility={top['plausibility']}, usefulness={top['usefulness']}, "
-        f"safety={top['safety']})"
-    )
-    if top.get("judge_notes"):
-        st.markdown(f"**Judge notes:** {top['judge_notes']}")
+
+    def keep_row(row) -> bool:
+        v = (row["final_verdict"] or "").upper()
+        if filter_choice == "Agent ACCEPT only":
+            return v == "ACCEPT"
+        elif filter_choice == "Agent ACCEPT + SOFT_REJECT":
+            return v in ("ACCEPT", "SOFT_REJECT")
+        else:
+            return True
+
+    df_filtered = df[df.apply(keep_row, axis=1)].copy()
+
+    if not df_filtered.empty:
+        top = df_filtered.iloc[0]
+
+        st.markdown("### Best candidate (by final verdict, judge score, and P-auto-resolve)")
+
+        st.markdown(f"**Role:** {top['role']} – **Angle:** {top['angle']}")
+        st.markdown(f"**Title:** {top['title']}")
+        st.markdown(f"**Proto-question:** {top['question']}")
+        st.markdown(f"**Candidate-source (family):** {top['candidate_source']}")
+
+        st.markdown(
+            f"**Final verdict (agent):** {top['final_verdict']} – "
+            f"P-auto-resolve={top['p_auto_resolve']:.2f}, "
+            f"Judge overall={top['overall_judge']:.2f} (rank={top['judge_rank']})"
+        )
+        st.markdown(
+            f"**Judge scores:** clarity={top['clarity']}, resolvability={top['resolvability']}, "
+            f"forecastability={top['forecastability']}, decision_relevance={top['decision_relevance']}, "
+            f"cost_safety={top['cost_safety']} (verdict={top['judge_verdict']})"
+        )
+        if isinstance(top.get("judge_rationale"), str) and top["judge_rationale"]:
+            st.markdown(f"**Judge rationale:** {top['judge_rationale']}")
+
+        if isinstance(top.get("agent_verdict"), str) and top["agent_verdict"]:
+            st.markdown("**Agent decision & resolution hint:**")
+            st.markdown(
+                f"- **Agent verdict:** {top['agent_verdict']} "
+                f"(P-auto-resolve={top['p_auto_resolve']:.2f})"
+            )
+            if top.get("agent_resolution_hint"):
+                st.markdown(f"- **Resolution hint:** {top['agent_resolution_hint']}")
+            if top.get("agent_rationale"):
+                st.markdown(f"- **Agent rationale:** {top['agent_rationale']}")
+
+        st.markdown("### Table of proto-questions")
+        st.caption(
+            "Sorted by final verdict (agent), judge overall score, and P-auto-resolve. "
+            "Questions beyond the K best are marked as DROPPED_BY_JUDGE (no agent evaluation)."
+        )
+        st.dataframe(
+            df_filtered[
+                [
+                    "rank_overall",
+                    "judge_rank",
+                    "final_verdict",
+                    "p_auto_resolve",
+                    "overall_judge",
+                    "role",
+                    "angle",
+                    "title",
+                    "question",
+                    "agent_verdict",
+                    "agent_resolution_hint",
+                    "agent_rationale",
+                ]
+            ],
+            use_container_width=True,
+        )
+    else:
+        st.info("No rows match the selected filter.")
 
     # Downloads
     st.subheader("Download")
@@ -810,34 +1178,44 @@ if res is not None:
     for e in entries:
         export_list.append(
             {
+                "seed": seed,
                 "question": e["question"],
-                "scores": e["scores"],
+                "judge": e["judge"],
+                "agent": e["agent"],
+                "final": e["final"],
             }
         )
-    import json as _json
 
     json_bytes = _json.dumps(
-        {"model": model, "entries": export_list},
+        {
+            "model": model,
+            "seed": seed,
+            "tags": tags,
+            "horizon": horizon,
+            "entries": export_list,
+        },
         ensure_ascii=False,
         indent=2,
     ).encode("utf-8")
 
     col1, col2 = st.columns(2)
     col1.download_button(
-        "Download CSV",
+        "Download CSV (flat view)",
         data=csv_bytes,
-        file_name="metaculus_topK_questions.csv",
+        file_name="metaculus_proto_cluster_pipeline.csv",
         mime="text/csv",
     )
     col2.download_button(
-        "Download JSON",
+        "Download JSON (nested)",
         data=json_bytes,
-        file_name="metaculus_topK_questions.json",
+        file_name="metaculus_proto_cluster_pipeline.json",
         mime="application/json",
     )
 
-    # Zone optionnelle pour inspecter la sortie brute du générateur
     with st.expander("Raw generation output (debug)"):
-        st.code(raw_output, language="text")
+        if raw_output:
+            st.code(raw_output, language="text")
+        else:
+            st.caption("No raw generator output stored (dry_run or mock mode).")
 else:
-    st.info("Configure your topic and click 'Generate + Judge questions' to start.")
+    st.info("Configure X, K and the seed prompt, then click the button to run the full pipeline.")
